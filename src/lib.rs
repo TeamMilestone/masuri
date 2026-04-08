@@ -12,6 +12,8 @@ pub mod scanner;
 pub mod scanner_neon;
 pub mod decoder;
 pub mod img_scanner;
+#[cfg(feature = "python")]
+mod python;
 
 /// Decoded barcode result
 #[derive(Debug, Clone)]
