@@ -247,10 +247,10 @@ fn validate_checksum(dcode: &Decoder) -> bool {
 }
 
 fn postprocess_code128(dcode: &mut Decoder) -> bool {
-    let len = dcode.code128.character as usize;
-    if len < 3 { return true; }
+    if (dcode.code128.character as usize) < 3 { return true; }
 
     if dcode.code128.direction != 0 {
+        let len = dcode.code128.character as usize;
         let half = len / 2;
         for i in 0..half {
             let j = len - 1 - i;
@@ -265,17 +265,22 @@ fn postprocess_code128(dcode: &mut Decoder) -> bool {
     let mut j = 0usize;
     let mut cexp = if code == START_C { 1usize } else { 0 };
 
-    let mut i = 1;
-    while i < len.saturating_sub(2) {
+    let mut i = 1usize;
+    // C: for(i = 1, j = 0; i < dcode128->character - 2; i++)
+    // character may change during postprocess_c, so re-read each iteration
+    while i < (dcode.code128.character as usize).saturating_sub(2) {
         let code = dcode.buf[i];
         if code & 0x80 != 0 { return true; }
 
         if (charset & 0x2) != 0 && code < 100 {
+            // defer character set C for expansion
             i += 1;
             continue;
         } else if code < 0x60 {
+            // convert character set B to ASCII
             let mut ascii = code + 0x20;
             if (charset == 0 || charset == 0x81) && ascii >= 0x60 {
+                // convert character set A to ASCII
                 ascii -= 0x60;
             }
             if j < dcode.buf.len() {
@@ -287,6 +292,7 @@ fn postprocess_code128(dcode: &mut Decoder) -> bool {
             }
         } else {
             if charset & 0x2 != 0 && cexp > 0 {
+                // expand character set C to ASCII
                 let delta = postprocess_c(dcode, cexp, i, j);
                 i += delta;
                 j += delta * 2;
@@ -297,10 +303,9 @@ fn postprocess_code128(dcode: &mut Decoder) -> bool {
                     charset |= 0x80;
                 }
             } else if code == FNC1 {
-                // FNC1 - GS1 support
                 if i == 1 {
                     // GS1 modifier
-                } else if i < len.saturating_sub(3) {
+                } else if i < (dcode.code128.character as usize).saturating_sub(3) {
                     if j < dcode.buf.len() {
                         dcode.buf[j] = 0x1d;
                     }
@@ -428,7 +433,7 @@ pub fn decode_code128(dcode: &mut Decoder) -> SymbolType {
             return SymbolType::None;
         }
     }
-    dcode.code128.width = dcode.code128.s6;  // Update width tracker
+    dcode.code128.width = dcode.code128.s6;
 
     // 0.23: Acquire lock on first data character (character == 1)
     if dcode.code128.character == 1 {

@@ -59,9 +59,9 @@ impl std::fmt::Display for SymbolType {
     }
 }
 
-/// Decode barcodes from a grayscale image buffer
+/// Decode barcodes from a grayscale image buffer (uses parallel scanning by default)
 pub fn decode(gray: &[u8], width: u32, height: u32) -> Vec<Decoded> {
-    img_scanner::scan_image(gray, width, height)
+    img_scanner::scan_image_parallel(gray, width, height)
 }
 
 /// Decode barcodes from a grayscale image buffer using parallel scanning
