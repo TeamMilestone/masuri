@@ -58,19 +58,6 @@ fn scan_at_scale(gray: &[u8], w: usize, h: usize) -> Vec<Decoded> {
         y += density;
     }
 
-    let row_results: Vec<Vec<DecodedSymbol>> = row_indices
-        .par_iter()
-        .map(|&y| {
-            let mut scn = Scanner::new();
-            let mut dcode = Decoder::new();
-            scan_single_row(gray, w, y, true, &mut scn, &mut dcode);
-            scn.new_scan();
-            dcode.new_scan();
-            scan_single_row(gray, w, y, false, &mut scn, &mut dcode);
-            dcode.results
-        })
-        .collect();
-
     let mut col_indices: Vec<usize> = Vec::new();
     let border_x = (((w - 1) % density) + 1) / 2;
     let border_x = border_x.min(w / 2);
@@ -80,24 +67,35 @@ fn scan_at_scale(gray: &[u8], w: usize, h: usize) -> Vec<Decoded> {
         x += density;
     }
 
-    let col_results: Vec<Vec<DecodedSymbol>> = col_indices
-        .par_iter()
-        .map(|&x| {
+    // Single par_iter over all row + col tasks — no barrier between phases
+    let num_rows = row_indices.len();
+    let total = num_rows + col_indices.len();
+
+    let all_results: Vec<Vec<DecodedSymbol>> = (0..total)
+        .into_par_iter()
+        .map(|i| {
             let mut scn = Scanner::new();
             let mut dcode = Decoder::new();
-            scan_single_col(gray, w, h, x, true, &mut scn, &mut dcode);
-            scn.new_scan();
-            dcode.new_scan();
-            scan_single_col(gray, w, h, x, false, &mut scn, &mut dcode);
+            if i < num_rows {
+                let y = row_indices[i];
+                scan_single_row(gray, w, y, true, &mut scn, &mut dcode);
+                scn.new_scan();
+                dcode.new_scan();
+                scan_single_row(gray, w, y, false, &mut scn, &mut dcode);
+            } else {
+                let x = col_indices[i - num_rows];
+                scan_single_col(gray, w, h, x, true, &mut scn, &mut dcode);
+                scn.new_scan();
+                dcode.new_scan();
+                scan_single_col(gray, w, h, x, false, &mut scn, &mut dcode);
+            }
             dcode.results
         })
         .collect();
 
-    let mut all_results: Vec<DecodedSymbol> = Vec::new();
-    for r in row_results { all_results.extend(r); }
-    for r in col_results { all_results.extend(r); }
-
-    dedup_results(&all_results)
+    let mut results: Vec<DecodedSymbol> = Vec::new();
+    for r in all_results { results.extend(r); }
+    dedup_results(&results)
 }
 
 fn rescale(gray: &[u8], w: usize, h: usize, pct: usize) -> Vec<u8> {
@@ -221,180 +219,180 @@ pub fn scan_image_neon_parallel(gray: &[u8], width: u32, height: u32) -> Vec<Dec
     let w = width as usize;
     let h = height as usize;
 
-    // Group rows into batches of 4 for NEON
-    let mut row_batches: Vec<[usize; 4]> = Vec::new();
+    // Collect all scan tasks into a single list — no barriers between phases
+    enum ScanTask {
+        NeonRows([usize; 4]),
+        ScalarRow(usize),
+        NeonCols([usize; 4]),
+        ScalarCol(usize),
+    }
+
+    let mut tasks: Vec<ScanTask> = Vec::new();
+
+    // Row tasks
     let mut y = 0usize;
     while y + 3 < h {
-        row_batches.push([y, y + 1, y + 2, y + 3]);
+        tasks.push(ScanTask::NeonRows([y, y + 1, y + 2, y + 3]));
         y += 4;
     }
-    // Remaining rows handled by scalar
-    let remaining_rows: Vec<usize> = (y..h).collect();
+    while y < h {
+        tasks.push(ScanTask::ScalarRow(y));
+        y += 1;
+    }
 
-    // NEON batched row scanning with rayon
-    let neon_row_results: Vec<Vec<DecodedSymbol>> = row_batches
-        .par_iter()
-        .map(|batch| {
-            let mut all = Vec::new();
-            // Forward scan with NEON
-            {
-                let mut nscn = NeonScanner4::new();
-                let mut decoders = [Decoder::new(), Decoder::new(), Decoder::new(), Decoder::new()];
-                for x in 0..w {
-                    let edges = nscn.scan_y_4(
-                        gray[x + batch[0] * w] as i32,
-                        gray[x + batch[1] * w] as i32,
-                        gray[x + batch[2] * w] as i32,
-                        gray[x + batch[3] * w] as i32,
-                    );
-                    for lane in 0..4 {
-                        if edges[lane].has_edge {
-                            decoders[lane].decode_width(edges[lane].width);
-                        }
-                    }
-                }
-                for lane in 0..4 {
-                    let r = nscn.flush_lane(lane);
-                    if r.has_edge { decoders[lane].decode_width(r.width); }
-                    let r = nscn.flush_lane(lane);
-                    if r.has_edge { decoders[lane].decode_width(r.width); }
-                    decoders[lane].decode_width(0);
-                }
-                for d in &decoders { all.extend(d.results.iter().cloned()); }
-            }
-            // Reverse scan with NEON
-            {
-                let mut nscn = NeonScanner4::new();
-                let mut decoders = [Decoder::new(), Decoder::new(), Decoder::new(), Decoder::new()];
-                for x in (0..w).rev() {
-                    let edges = nscn.scan_y_4(
-                        gray[x + batch[0] * w] as i32,
-                        gray[x + batch[1] * w] as i32,
-                        gray[x + batch[2] * w] as i32,
-                        gray[x + batch[3] * w] as i32,
-                    );
-                    for lane in 0..4 {
-                        if edges[lane].has_edge {
-                            decoders[lane].decode_width(edges[lane].width);
-                        }
-                    }
-                }
-                for lane in 0..4 {
-                    let r = nscn.flush_lane(lane);
-                    if r.has_edge { decoders[lane].decode_width(r.width); }
-                    let r = nscn.flush_lane(lane);
-                    if r.has_edge { decoders[lane].decode_width(r.width); }
-                    decoders[lane].decode_width(0);
-                }
-                for d in &decoders { all.extend(d.results.iter().cloned()); }
-            }
-            all
-        })
-        .collect();
-
-    // Scalar scan for remaining rows
-    let scalar_row_results: Vec<Vec<DecodedSymbol>> = remaining_rows
-        .par_iter()
-        .map(|&y| {
-            let mut scn = Scanner::new();
-            let mut dcode = Decoder::new();
-            scan_single_row(gray, w, y, true, &mut scn, &mut dcode);
-            scn.new_scan();
-            dcode.new_scan();
-            scan_single_row(gray, w, y, false, &mut scn, &mut dcode);
-            dcode.results
-        })
-        .collect();
-
-    // Column scanning: group 4 columns with NEON
-    let mut col_batches: Vec<[usize; 4]> = Vec::new();
+    // Column tasks
     let mut x = 0usize;
     while x + 3 < w {
-        col_batches.push([x, x + 1, x + 2, x + 3]);
+        tasks.push(ScanTask::NeonCols([x, x + 1, x + 2, x + 3]));
         x += 4;
     }
-    let remaining_cols: Vec<usize> = (x..w).collect();
+    while x < w {
+        tasks.push(ScanTask::ScalarCol(x));
+        x += 1;
+    }
 
-    let neon_col_results: Vec<Vec<DecodedSymbol>> = col_batches
+    // Single par_iter over all tasks — 4 barriers → 1
+    let all_results: Vec<Vec<DecodedSymbol>> = tasks
         .par_iter()
-        .map(|batch| {
-            let mut all = Vec::new();
-            // Forward
-            {
-                let mut nscn = NeonScanner4::new();
-                let mut decoders = [Decoder::new(), Decoder::new(), Decoder::new(), Decoder::new()];
-                for y in 0..h {
-                    let edges = nscn.scan_y_4(
-                        gray[batch[0] + y * w] as i32,
-                        gray[batch[1] + y * w] as i32,
-                        gray[batch[2] + y * w] as i32,
-                        gray[batch[3] + y * w] as i32,
-                    );
-                    for lane in 0..4 {
-                        if edges[lane].has_edge {
-                            decoders[lane].decode_width(edges[lane].width);
+        .map(|task| {
+            match task {
+                ScanTask::NeonRows(batch) => {
+                    let mut all = Vec::new();
+                    // Forward
+                    {
+                        let mut nscn = NeonScanner4::new();
+                        let mut decoders = [Decoder::new(), Decoder::new(), Decoder::new(), Decoder::new()];
+                        for x in 0..w {
+                            let edges = nscn.scan_y_4(
+                                gray[x + batch[0] * w] as i32,
+                                gray[x + batch[1] * w] as i32,
+                                gray[x + batch[2] * w] as i32,
+                                gray[x + batch[3] * w] as i32,
+                            );
+                            for lane in 0..4 {
+                                if edges[lane].has_edge {
+                                    decoders[lane].decode_width(edges[lane].width);
+                                }
+                            }
                         }
-                    }
-                }
-                for lane in 0..4 {
-                    let r = nscn.flush_lane(lane);
-                    if r.has_edge { decoders[lane].decode_width(r.width); }
-                    let r = nscn.flush_lane(lane);
-                    if r.has_edge { decoders[lane].decode_width(r.width); }
-                    decoders[lane].decode_width(0);
-                }
-                for d in &decoders { all.extend(d.results.iter().cloned()); }
-            }
-            // Reverse
-            {
-                let mut nscn = NeonScanner4::new();
-                let mut decoders = [Decoder::new(), Decoder::new(), Decoder::new(), Decoder::new()];
-                for y in (0..h).rev() {
-                    let edges = nscn.scan_y_4(
-                        gray[batch[0] + y * w] as i32,
-                        gray[batch[1] + y * w] as i32,
-                        gray[batch[2] + y * w] as i32,
-                        gray[batch[3] + y * w] as i32,
-                    );
-                    for lane in 0..4 {
-                        if edges[lane].has_edge {
-                            decoders[lane].decode_width(edges[lane].width);
+                        for lane in 0..4 {
+                            let r = nscn.flush_lane(lane);
+                            if r.has_edge { decoders[lane].decode_width(r.width); }
+                            let r = nscn.flush_lane(lane);
+                            if r.has_edge { decoders[lane].decode_width(r.width); }
+                            decoders[lane].decode_width(0);
                         }
+                        for d in &decoders { all.extend(d.results.iter().cloned()); }
                     }
+                    // Reverse
+                    {
+                        let mut nscn = NeonScanner4::new();
+                        let mut decoders = [Decoder::new(), Decoder::new(), Decoder::new(), Decoder::new()];
+                        for x in (0..w).rev() {
+                            let edges = nscn.scan_y_4(
+                                gray[x + batch[0] * w] as i32,
+                                gray[x + batch[1] * w] as i32,
+                                gray[x + batch[2] * w] as i32,
+                                gray[x + batch[3] * w] as i32,
+                            );
+                            for lane in 0..4 {
+                                if edges[lane].has_edge {
+                                    decoders[lane].decode_width(edges[lane].width);
+                                }
+                            }
+                        }
+                        for lane in 0..4 {
+                            let r = nscn.flush_lane(lane);
+                            if r.has_edge { decoders[lane].decode_width(r.width); }
+                            let r = nscn.flush_lane(lane);
+                            if r.has_edge { decoders[lane].decode_width(r.width); }
+                            decoders[lane].decode_width(0);
+                        }
+                        for d in &decoders { all.extend(d.results.iter().cloned()); }
+                    }
+                    all
                 }
-                for lane in 0..4 {
-                    let r = nscn.flush_lane(lane);
-                    if r.has_edge { decoders[lane].decode_width(r.width); }
-                    let r = nscn.flush_lane(lane);
-                    if r.has_edge { decoders[lane].decode_width(r.width); }
-                    decoders[lane].decode_width(0);
+                ScanTask::ScalarRow(y) => {
+                    let mut scn = Scanner::new();
+                    let mut dcode = Decoder::new();
+                    scan_single_row(gray, w, *y, true, &mut scn, &mut dcode);
+                    scn.new_scan();
+                    dcode.new_scan();
+                    scan_single_row(gray, w, *y, false, &mut scn, &mut dcode);
+                    dcode.results
                 }
-                for d in &decoders { all.extend(d.results.iter().cloned()); }
+                ScanTask::NeonCols(batch) => {
+                    let mut all = Vec::new();
+                    // Forward
+                    {
+                        let mut nscn = NeonScanner4::new();
+                        let mut decoders = [Decoder::new(), Decoder::new(), Decoder::new(), Decoder::new()];
+                        for y in 0..h {
+                            let edges = nscn.scan_y_4(
+                                gray[batch[0] + y * w] as i32,
+                                gray[batch[1] + y * w] as i32,
+                                gray[batch[2] + y * w] as i32,
+                                gray[batch[3] + y * w] as i32,
+                            );
+                            for lane in 0..4 {
+                                if edges[lane].has_edge {
+                                    decoders[lane].decode_width(edges[lane].width);
+                                }
+                            }
+                        }
+                        for lane in 0..4 {
+                            let r = nscn.flush_lane(lane);
+                            if r.has_edge { decoders[lane].decode_width(r.width); }
+                            let r = nscn.flush_lane(lane);
+                            if r.has_edge { decoders[lane].decode_width(r.width); }
+                            decoders[lane].decode_width(0);
+                        }
+                        for d in &decoders { all.extend(d.results.iter().cloned()); }
+                    }
+                    // Reverse
+                    {
+                        let mut nscn = NeonScanner4::new();
+                        let mut decoders = [Decoder::new(), Decoder::new(), Decoder::new(), Decoder::new()];
+                        for y in (0..h).rev() {
+                            let edges = nscn.scan_y_4(
+                                gray[batch[0] + y * w] as i32,
+                                gray[batch[1] + y * w] as i32,
+                                gray[batch[2] + y * w] as i32,
+                                gray[batch[3] + y * w] as i32,
+                            );
+                            for lane in 0..4 {
+                                if edges[lane].has_edge {
+                                    decoders[lane].decode_width(edges[lane].width);
+                                }
+                            }
+                        }
+                        for lane in 0..4 {
+                            let r = nscn.flush_lane(lane);
+                            if r.has_edge { decoders[lane].decode_width(r.width); }
+                            let r = nscn.flush_lane(lane);
+                            if r.has_edge { decoders[lane].decode_width(r.width); }
+                            decoders[lane].decode_width(0);
+                        }
+                        for d in &decoders { all.extend(d.results.iter().cloned()); }
+                    }
+                    all
+                }
+                ScanTask::ScalarCol(x) => {
+                    let mut scn = Scanner::new();
+                    let mut dcode = Decoder::new();
+                    scan_single_col(gray, w, h, *x, true, &mut scn, &mut dcode);
+                    scn.new_scan();
+                    dcode.new_scan();
+                    scan_single_col(gray, w, h, *x, false, &mut scn, &mut dcode);
+                    dcode.results
+                }
             }
-            all
         })
         .collect();
 
-    let scalar_col_results: Vec<Vec<DecodedSymbol>> = remaining_cols
-        .par_iter()
-        .map(|&x| {
-            let mut scn = Scanner::new();
-            let mut dcode = Decoder::new();
-            scan_single_col(gray, w, h, x, true, &mut scn, &mut dcode);
-            scn.new_scan();
-            dcode.new_scan();
-            scan_single_col(gray, w, h, x, false, &mut scn, &mut dcode);
-            dcode.results
-        })
-        .collect();
-
-    let mut all_results: Vec<DecodedSymbol> = Vec::new();
-    for r in neon_row_results { all_results.extend(r); }
-    for r in scalar_row_results { all_results.extend(r); }
-    for r in neon_col_results { all_results.extend(r); }
-    for r in scalar_col_results { all_results.extend(r); }
-
-    dedup_results(&all_results)
+    let mut results: Vec<DecodedSymbol> = Vec::new();
+    for r in all_results { results.extend(r); }
+    dedup_results(&results)
 }
 
 fn dedup_results(results: &[DecodedSymbol]) -> Vec<Decoded> {
