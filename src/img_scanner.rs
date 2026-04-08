@@ -20,11 +20,35 @@ pub fn scan_image(gray: &[u8], width: u32, height: u32) -> Vec<Decoded> {
 
 /// Scan a single image with parallel row scanning
 pub fn scan_image_parallel(gray: &[u8], width: u32, height: u32) -> Vec<Decoded> {
-    let w = width as usize;
-    let h = height as usize;
+    let mut all_results = scan_at_scale(gray, width as usize, height as usize);
+
+    // Multi-scale: try additional scales to catch barcodes missed at native resolution
+    for pct in [75, 110, 50, 150] {
+        if all_results.is_empty() || all_results.iter().all(|r| r.quality < 3) {
+            let sw = (width as usize * pct / 100).max(1);
+            let sh = (height as usize * pct / 100).max(1);
+            let scaled = rescale(gray, width as usize, height as usize, pct);
+            let extra = scan_at_scale(&scaled, sw, sh);
+            all_results.extend(extra);
+        } else {
+            break;
+        }
+    }
+
+    // Dedup across scales
+    let mut seen: HashMap<String, Decoded> = HashMap::new();
+    for r in all_results {
+        let entry = seen.entry(r.data.clone()).or_insert(r.clone());
+        if r.quality > entry.quality {
+            *entry = r;
+        }
+    }
+    seen.into_values().collect()
+}
+
+fn scan_at_scale(gray: &[u8], w: usize, h: usize) -> Vec<Decoded> {
     let density = 1usize;
 
-    // Collect row indices
     let mut row_indices: Vec<usize> = Vec::new();
     let border = (((h - 1) % density) + 1) / 2;
     let border = border.min(h / 2);
@@ -34,25 +58,19 @@ pub fn scan_image_parallel(gray: &[u8], width: u32, height: u32) -> Vec<Decoded>
         y += density;
     }
 
-    // Parallel scan rows
     let row_results: Vec<Vec<DecodedSymbol>> = row_indices
         .par_iter()
         .map(|&y| {
             let mut scn = Scanner::new();
             let mut dcode = Decoder::new();
-
-            // Forward scan
             scan_single_row(gray, w, y, true, &mut scn, &mut dcode);
-            // Reverse scan would start fresh
             scn.new_scan();
             dcode.new_scan();
             scan_single_row(gray, w, y, false, &mut scn, &mut dcode);
-
             dcode.results
         })
         .collect();
 
-    // Collect column indices
     let mut col_indices: Vec<usize> = Vec::new();
     let border_x = (((w - 1) % density) + 1) / 2;
     let border_x = border_x.min(w / 2);
@@ -62,28 +80,33 @@ pub fn scan_image_parallel(gray: &[u8], width: u32, height: u32) -> Vec<Decoded>
         x += density;
     }
 
-    // Parallel scan columns
     let col_results: Vec<Vec<DecodedSymbol>> = col_indices
         .par_iter()
         .map(|&x| {
             let mut scn = Scanner::new();
             let mut dcode = Decoder::new();
-
             scan_single_col(gray, w, h, x, true, &mut scn, &mut dcode);
             scn.new_scan();
             dcode.new_scan();
             scan_single_col(gray, w, h, x, false, &mut scn, &mut dcode);
-
             dcode.results
         })
         .collect();
 
-    // Merge all results
     let mut all_results: Vec<DecodedSymbol> = Vec::new();
     for r in row_results { all_results.extend(r); }
     for r in col_results { all_results.extend(r); }
 
     dedup_results(&all_results)
+}
+
+fn rescale(gray: &[u8], w: usize, h: usize, pct: usize) -> Vec<u8> {
+    use image::{GrayImage, imageops};
+    let nw = (w as u32 * pct as u32 / 100).max(1);
+    let nh = (h as u32 * pct as u32 / 100).max(1);
+    let img = GrayImage::from_raw(w as u32, h as u32, gray.to_vec()).unwrap();
+    let resized = imageops::resize(&img, nw, nh, imageops::FilterType::Triangle);
+    resized.into_raw()
 }
 
 fn scan_single_row(gray: &[u8], w: usize, y: usize, forward: bool, scn: &mut Scanner, dcode: &mut Decoder) {
@@ -107,11 +130,13 @@ fn scan_single_row(gray: &[u8], w: usize, y: usize, forward: bool, scn: &mut Sca
             }
         }
     }
-    // flush
+    // quiet_border: flush + flush + new_scan (matches C zbar)
     let r = scn.flush();
     if r.edge != crate::scanner::EdgeType::None { dcode.decode_width(r.width); }
     let r = scn.flush();
     if r.edge != crate::scanner::EdgeType::None { dcode.decode_width(r.width); }
+    // C zbar sends width=0 on final flush to signal end of scan line
+    dcode.decode_width(0);
 }
 
 fn scan_single_col(gray: &[u8], w: usize, h: usize, x: usize, forward: bool, scn: &mut Scanner, dcode: &mut Decoder) {
@@ -139,6 +164,7 @@ fn scan_single_col(gray: &[u8], w: usize, h: usize, x: usize, forward: bool, scn
     if r.edge != crate::scanner::EdgeType::None { dcode.decode_width(r.width); }
     let r = scn.flush();
     if r.edge != crate::scanner::EdgeType::None { dcode.decode_width(r.width); }
+    dcode.decode_width(0);
 }
 
 fn scan_rows(gray: &[u8], width: u32, height: u32, scn: &mut Scanner, dcode: &mut Decoder, density: u32) {
@@ -232,6 +258,7 @@ pub fn scan_image_neon_parallel(gray: &[u8], width: u32, height: u32) -> Vec<Dec
                     if r.has_edge { decoders[lane].decode_width(r.width); }
                     let r = nscn.flush_lane(lane);
                     if r.has_edge { decoders[lane].decode_width(r.width); }
+                    decoders[lane].decode_width(0);
                 }
                 for d in &decoders { all.extend(d.results.iter().cloned()); }
             }
@@ -257,6 +284,7 @@ pub fn scan_image_neon_parallel(gray: &[u8], width: u32, height: u32) -> Vec<Dec
                     if r.has_edge { decoders[lane].decode_width(r.width); }
                     let r = nscn.flush_lane(lane);
                     if r.has_edge { decoders[lane].decode_width(r.width); }
+                    decoders[lane].decode_width(0);
                 }
                 for d in &decoders { all.extend(d.results.iter().cloned()); }
             }
@@ -313,6 +341,7 @@ pub fn scan_image_neon_parallel(gray: &[u8], width: u32, height: u32) -> Vec<Dec
                     if r.has_edge { decoders[lane].decode_width(r.width); }
                     let r = nscn.flush_lane(lane);
                     if r.has_edge { decoders[lane].decode_width(r.width); }
+                    decoders[lane].decode_width(0);
                 }
                 for d in &decoders { all.extend(d.results.iter().cloned()); }
             }
@@ -338,6 +367,7 @@ pub fn scan_image_neon_parallel(gray: &[u8], width: u32, height: u32) -> Vec<Dec
                     if r.has_edge { decoders[lane].decode_width(r.width); }
                     let r = nscn.flush_lane(lane);
                     if r.has_edge { decoders[lane].decode_width(r.width); }
+                    decoders[lane].decode_width(0);
                 }
                 for d in &decoders { all.extend(d.results.iter().cloned()); }
             }
