@@ -116,7 +116,7 @@ fn main() {
         // Decode all images in parallel
         let all_results: Vec<(&str, Vec<masuri::Decoded>)> = images.par_iter()
             .map(|(path, pixels, w, h)| {
-                let results = if neon {
+                let mut results = if neon {
                     #[cfg(target_arch = "aarch64")]
                     { masuri::decode_neon_parallel(pixels, *w, *h) }
                     #[cfg(not(target_arch = "aarch64"))]
@@ -126,6 +126,13 @@ fn main() {
                 } else {
                     masuri::decode(pixels, *w, *h)
                 };
+                // Scale coordinates back to original image size
+                if scale_pct < 100 {
+                    for r in &mut results {
+                        r.x = r.x * 100 / scale_pct;
+                        r.y = r.y * 100 / scale_pct;
+                    }
+                }
                 (path.as_str(), results)
             })
             .collect();
@@ -137,7 +144,7 @@ fn main() {
                     println!("{}: (no barcode found)", fname);
                 } else {
                     for r in results {
-                        println!("{}: {} [{}] q={}", fname, r.data, r.sym_type, r.quality);
+                        println!("{}: {} [{}] q={} x={} y={}", fname, r.data, r.sym_type, r.quality, r.x, r.y);
                     }
                 }
             }

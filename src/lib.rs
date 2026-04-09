@@ -21,6 +21,8 @@ pub struct Decoded {
     pub data: String,
     pub sym_type: SymbolType,
     pub quality: i32,
+    pub x: u32,
+    pub y: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -13,13 +13,17 @@ struct BarcodeResult {
     symbol_type: String,
     #[pyo3(get)]
     quality: i32,
+    #[pyo3(get)]
+    x: u32,
+    #[pyo3(get)]
+    y: u32,
 }
 
 #[pymethods]
 impl BarcodeResult {
     fn __repr__(&self) -> String {
-        format!("BarcodeResult(data='{}', type='{}', quality={})",
-            self.data, self.symbol_type, self.quality)
+        format!("BarcodeResult(data='{}', type='{}', quality={}, x={}, y={})",
+            self.data, self.symbol_type, self.quality, self.x, self.y)
     }
 }
 
@@ -40,6 +44,8 @@ fn decode(gray: &[u8], width: u32, height: u32) -> Vec<BarcodeResult> {
             data: r.data,
             symbol_type: r.sym_type.to_string(),
             quality: r.quality,
+            x: r.x,
+            y: r.y,
         })
         .collect()
 }
@@ -63,6 +69,8 @@ fn decode_file(path: &str) -> PyResult<Vec<BarcodeResult>> {
             data: r.data,
             symbol_type: r.sym_type.to_string(),
             quality: r.quality,
+            x: r.x,
+            y: r.y,
         })
         .collect())
 }

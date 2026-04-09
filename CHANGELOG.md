@@ -3,12 +3,20 @@
 ## [0.1.1] - 2026-04-09
 
 ### Added
+- **Barcode position coordinates (x, y)** in all decoded results — enables position-based barcode selection (e.g. topmost barcode in multi-barcode images)
+  - Row scans: exact y, approximate x (pixel position at decode time)
+  - Column scans: exact x, approximate y
+  - Dedup merges coordinates via median across all detections
+  - Coordinates are scaled back to original image size when `--scale` is used
 - `--scale N` CLI option for image downscaling before scanning (default: 82%)
 - Fast integer bilinear interpolation (8.8 fixed-point) for downscaling
 - Parallel image loading with rayon `par_iter()`
 - Parallel image-level decoding (multiple images processed concurrently)
 
 ### Changed
+- CLI output format now includes coordinates: `filename: data [TYPE] q=N x=X y=Y`
+- `Decoded` struct now has `x: u32` and `y: u32` fields
+- Python `BarcodeResult` now exposes `x` and `y` attributes
 - Merged row and column scan phases into a single `par_iter` to eliminate synchronization barriers in both `scan_at_scale` (2 barriers -> 1) and `scan_image_neon_parallel` (4 barriers -> 1)
 - Default scan mode now downscales to 82% before scanning
 
@@ -19,6 +27,7 @@
 
 ### Fixed
 - Barcode #67 (`8026040246621`) now detected via 82% downscale, which was previously missed at native resolution by the NEON scanner
+- Multi-barcode selection (#44, #45, #46) can now be resolved using y-coordinate (select topmost barcode)
 
 ## [0.1.0] - 2026-04-08
 

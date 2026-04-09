@@ -23,6 +23,8 @@ fn test_cfg(config: u32, cfg: u32) -> bool {
 pub struct DecodedSymbol {
     pub sym_type: SymbolType,
     pub data: String,
+    pub x: u32,
+    pub y: u32,
 }
 
 pub struct Decoder {
@@ -39,6 +41,11 @@ pub struct Decoder {
 
     // Collected results for current scan line
     pub results: Vec<DecodedSymbol>,
+
+    // Position tracking (set by img_scanner before scanning)
+    pub scanline_coord: u32,  // row scan: y, col scan: x (exact axis)
+    pub cross_offset: u32,    // row scan: x, col scan: y (approximate axis)
+    pub is_row_scan: bool,    // true = row scan, false = col scan
 }
 
 impl Decoder {
@@ -53,6 +60,9 @@ impl Decoder {
             ean: ean::EanDecoder::new(),
             code128: code128::Code128Decoder::new(),
             results: Vec::new(),
+            scanline_coord: 0,
+            cross_offset: 0,
+            is_row_scan: true,
         };
         d.reset();
         d
@@ -149,9 +159,16 @@ impl Decoder {
         if self.sym_type != SymbolType::None && self.sym_type as i32 > SymbolType::Partial as i32 {
             // Collect decoded symbol
             let data = String::from_utf8_lossy(&self.buf[..self.buflen]).to_string();
+            let (x, y) = if self.is_row_scan {
+                (self.cross_offset, self.scanline_coord)
+            } else {
+                (self.scanline_coord, self.cross_offset)
+            };
             self.results.push(DecodedSymbol {
                 sym_type: self.sym_type,
                 data,
+                x,
+                y,
             });
             if self.lock != SymbolType::None && self.sym_type as i32 > SymbolType::Partial as i32 {
                 self.lock = SymbolType::None;

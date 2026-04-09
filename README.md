@@ -68,9 +68,11 @@ masuri images/
 
 Output format:
 ```
-filename.jpg: 301059785856 [CODE-128] q=50
-filename.jpg: 0034776000070 [EAN-13] q=1
+filename.jpg: 301059785856 [CODE-128] q=50 x=3503 y=1202
+filename.jpg: 0034776000070 [EAN-13] q=1 x=4146 y=3758
 ```
+
+Each result includes the barcode's approximate position in the image (x, y in pixels). Useful for selecting the correct barcode when multiple are present (e.g. pick the topmost by smallest y).
 
 ### Library
 
@@ -81,7 +83,7 @@ let img = image::open("barcode.jpg").unwrap().to_luma8();
 let results = decode(img.as_raw(), img.width(), img.height());
 
 for r in &results {
-    println!("{} [{}] quality={}", r.data, r.sym_type, r.quality);
+    println!("{} [{}] quality={} at ({}, {})", r.data, r.sym_type, r.quality, r.x, r.y);
 }
 
 // NEON + rayon (aarch64)
@@ -100,6 +102,8 @@ maturin develop --release --features python
 ```python
 import masuri
 results = masuri.decode(pixels, width, height)
+for r in results:
+    print(f"{r.data} [{r.symbol_type}] q={r.quality} x={r.x} y={r.y}")
 ```
 
 ## Supported symbologies
