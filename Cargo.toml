@@ -1,6 +1,6 @@
 [package]
 name = "masuri"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Fast barcode decoder for Code128/EAN/UPC - Rust port of zbar with NEON SIMD and rayon parallelism"
 license = "LGPL-2.1-or-later"
@@ -15,6 +15,11 @@ readme = "README.md"
 name = "masuri"
 path = "src/main.rs"
 
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["android"]
+
 [lib]
 name = "masuri"
 path = "src/lib.rs"
@@ -24,10 +29,12 @@ crate-type = ["cdylib", "rlib"]
 image = "0.25"
 rayon = "1.10"
 pyo3 = { version = "0.24", features = ["extension-module"], optional = true }
+uniffi = { version = "0.28", optional = true, features = ["cli"] }
 
 [features]
 default = []
 python = ["pyo3"]
+android = ["uniffi"]
 
 [profile.release]
 opt-level = 3

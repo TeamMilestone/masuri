@@ -15,7 +15,11 @@ pub mod img_scanner;
 #[cfg(feature = "python")]
 mod python;
 
+#[cfg(feature = "android")]
+uniffi::setup_scaffolding!();
+
 /// Decoded barcode result
+#[cfg_attr(feature = "android", derive(uniffi::Record))]
 #[derive(Debug, Clone)]
 pub struct Decoded {
     pub data: String,
@@ -25,6 +29,7 @@ pub struct Decoded {
     pub y: u32,
 }
 
+#[cfg_attr(feature = "android", derive(uniffi::Enum))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(i32)]
 pub enum SymbolType {
@@ -66,6 +71,13 @@ impl std::fmt::Display for SymbolType {
 /// Decode barcodes from a grayscale image buffer (uses parallel scanning by default)
 pub fn decode(gray: &[u8], width: u32, height: u32) -> Vec<Decoded> {
     img_scanner::scan_image_parallel(gray, width, height)
+}
+
+/// UniFFI entry point — takes owned bytes (Kotlin `ByteArray` maps to `Vec<u8>`).
+#[cfg(feature = "android")]
+#[uniffi::export]
+pub fn decode_bytes(gray: Vec<u8>, width: u32, height: u32) -> Vec<Decoded> {
+    img_scanner::scan_image_parallel(&gray, width, height)
 }
 
 /// Decode barcodes from a grayscale image buffer using parallel scanning

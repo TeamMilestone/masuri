@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.2] - 2026-04-17
+
+### Added
+- **Android / Kotlin bindings via UniFFI** — new `android` feature gates `uniffi` (0.28) and exposes `decode_bytes(Vec<u8>, u32, u32) -> Vec<Decoded>` for JNI consumption
+- `uniffi-bindgen` helper binary (`required-features = ["android"]`) for generating Kotlin bindings from the compiled `.so`
+- `#[derive(uniffi::Record)]` on `Decoded` and `#[derive(uniffi::Enum)]` on `SymbolType` (feature-gated), enabling proc-macro FFI scaffolding without a separate UDL file
+
+### Build
+- Cross-compilation to `aarch64-linux-android` verified via `cargo ndk` (NDK r28) — `libmasuri.so` ~900KB release
+- Default and `python` feature builds unchanged; `android` feature is opt-in and does not affect desktop/PyPI artifacts
+
 ## [0.1.1] - 2026-04-09
 
 ### Added

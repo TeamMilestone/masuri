@@ -4,3 +4,6 @@ Cargo.lock
 __pycache__/
 *.egg-info/
 dist/
+.env
+/android/jniLibs/
+/android/kotlin/
