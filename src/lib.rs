@@ -74,10 +74,19 @@ pub fn decode(gray: &[u8], width: u32, height: u32) -> Vec<Decoded> {
 }
 
 /// UniFFI entry point — takes owned bytes (Kotlin `ByteArray` maps to `Vec<u8>`).
+/// Uses the NEON + rayon scanner on aarch64 (Android ARM64, Apple Silicon),
+/// and falls back to the scalar parallel scanner on other targets.
 #[cfg(feature = "android")]
 #[uniffi::export]
 pub fn decode_bytes(gray: Vec<u8>, width: u32, height: u32) -> Vec<Decoded> {
-    img_scanner::scan_image_parallel(&gray, width, height)
+    #[cfg(target_arch = "aarch64")]
+    {
+        img_scanner::scan_image_neon_parallel(&gray, width, height)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        img_scanner::scan_image_parallel(&gray, width, height)
+    }
 }
 
 /// Decode barcodes from a grayscale image buffer using parallel scanning
