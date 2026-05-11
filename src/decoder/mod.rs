@@ -5,6 +5,7 @@
 
 pub mod ean;
 pub mod code128;
+pub mod i25;
 
 use crate::SymbolType;
 
@@ -38,6 +39,7 @@ pub struct Decoder {
 
     pub ean: ean::EanDecoder,
     pub code128: code128::Code128Decoder,
+    pub i25: i25::I25Decoder,
 
     // Collected results for current scan line
     pub results: Vec<DecodedSymbol>,
@@ -59,6 +61,7 @@ impl Decoder {
             buflen: 0,
             ean: ean::EanDecoder::new(),
             code128: code128::Code128Decoder::new(),
+            i25: i25::I25Decoder::new(),
             results: Vec::new(),
             scanline_coord: 0,
             cross_offset: 0,
@@ -75,6 +78,7 @@ impl Decoder {
         self.lock = SymbolType::None;
         self.ean.reset();
         self.code128.reset();
+        self.i25.reset();
     }
 
     pub fn new_scan(&mut self) {
@@ -83,6 +87,7 @@ impl Decoder {
         self.idx = 0;
         self.ean.new_scan();
         self.code128.reset();
+        self.i25.reset();
     }
 
     #[inline(always)]
@@ -149,6 +154,14 @@ impl Decoder {
         // Code 128 decoder
         if self.code128.enabled() {
             let sym = code128::decode_code128(self);
+            if sym as i32 > SymbolType::Partial as i32 {
+                self.sym_type = sym;
+            }
+        }
+
+        // Interleaved 2 of 5 decoder
+        if self.i25.enabled() {
+            let sym = i25::decode_i25(self);
             if sym as i32 > SymbolType::Partial as i32 {
                 self.sym_type = sym;
             }
