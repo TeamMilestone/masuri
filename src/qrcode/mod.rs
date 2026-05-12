@@ -13,5 +13,6 @@ pub mod hom_fit;
 pub mod isaac;
 pub mod qr_finder;
 pub mod rs;
+pub mod sampling_grid;
 pub mod util;
 pub mod version_info;
