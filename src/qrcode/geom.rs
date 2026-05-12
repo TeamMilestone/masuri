@@ -15,6 +15,9 @@ pub const QR_INT_BITS: i32 = 32;
 pub const QR_FINDER_SUBPREC: i32 = 2;
 /// Subpixel precision used for alignment-pattern sampling.
 pub const QR_ALIGN_SUBPREC: i32 = 2;
+/// Bit precision used for the homography output square. 14 bits keeps the
+/// ideal module size for v40 codes ≥ 2 apart from v39's.
+pub const QR_HOM_BITS: i32 = 14;
 
 /// A 2-D integer point. Mirrors `typedef int qr_point[2]` in `qrcode.h`.
 pub type QrPoint = [i32; 2];

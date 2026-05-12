@@ -9,6 +9,7 @@ pub mod binarize;
 pub mod finder;
 pub mod finder_centers;
 pub mod geom;
+pub mod hom_fit;
 pub mod isaac;
 pub mod qr_finder;
 pub mod rs;
