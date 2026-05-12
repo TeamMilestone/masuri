@@ -47,16 +47,21 @@ zbar의 구조적 특징: 1D 스캐너가 스캔라인을 훑으며 `1:1:3:1:1` 
 ## 확정된 결정 사항
 
 - **베이스 버전**: zbar-0.10. I2/5/Code128 포팅과 동일 베이스라 finder line
-  검출 콜백을 기존 1D 디코더에 끼워 넣기가 자연스럽다. (0.23 QR 변경점은
-  Phase 0 끝에 따로 검토하지만 별도 작업으로 미룬다.)
-- **Structured Append (다중 QR 합성)**: 스킵. GS25 라벨엔 불필요. zbar
-  `qrdec.c`의 해당 블록은 stub으로 두고 single QR만 디코딩한다.
+  검출 콜백을 기존 1D 디코더에 끼워 넣기가 자연스럽다. 0.23 변경점 검토는
+  Phase 6 이후로 미룬다 (2026-05-12 컨펌).
+- **Structured Append (다중 QR 합성)**: **전체 구현** (2026-05-12 컨펌, 원안
+  스킵에서 변경). `qr_code_data_parse` 안에 inline된 mode 4 블록(~400줄)을
+  통째로 포팅. 향후 다중 QR 사용 택배사가 들어와도 wire-printer만 분기 추가.
 - **ECI / Kanji**: 최소 구현. Byte 모드 + UTF-8 + ASCII만 우선 지원.
   GS25는 ASCII만 사용하므로 충분. ECI/Shift_JIS는 placeholder.
-- **외부 의존성**: 0 유지. `isaac.c` 사용처가 사소하면 포팅, 마스크 검증에
-  본질적으로 필요하면 결정론적 카운터로 교체.
+- **외부 의존성**: 0 유지. `isaac.c`는 **1:1 포팅** (2026-05-12 컨펌, 원안의
+  "사소하면 포팅 / 본질적이면 대체"에서 1:1로 확정). zbar C와 비트 단위
+  일치 검증을 유지하기 위함.
 - **부동소수점 정책**: zbar 0.10은 정수 산술 위주. 동일하게 유지하여
   C와 비교 검증 시 비트단위 일치를 노린다.
+- **Phase 4 분할**: 원안 4a~4h 8단계 → **3 모듈 (4-G / 4-F / 4-D)** 로 재편
+  (2026-05-12 컨펌). 의존 그래프 분석 결과 `qr_finder_ransac`이 phase B
+  helper를 역호출해 단계별 검증 불가. 상세는 `docs/qr-port-deps.md`.
 
 ## 사전 준비 (Phase 0 전에 1회만)
 
@@ -122,7 +127,7 @@ raw bitstream) 덤프하는 패치 파일을 따로 보관한다. Rust 측 동�
 - `qrcode/util.c` (140줄) → `src/qrcode/util.rs`. isqrt, ilog.
 - `qrcode/bch15_5.c` (184줄) → `src/qrcode/bch15_5.rs`.
 - `qrcode/rs.c` (799줄) → `src/qrcode/rs.rs`. GF(256) 테이블, RS decode.
-- isaac (Phase 0 결정에 따라).
+- `qrcode/isaac.c` (139줄) → `src/qrcode/isaac.rs`. ISAAC PRNG 1:1 포팅.
 
 검증:
 - 모듈별 `cargo test`. zbar 테스트 벡터가 있으면 그대로 차용. 없으면
@@ -140,29 +145,29 @@ raw bitstream) 덤프하는 패치 파일을 따로 보관한다. Rust 측 동�
 - 07 샘플 이진화 결과를 PNG로 덤프해 zbar C 동일 함수 출력과 픽셀 단위
   비교. 99% 이상 일치 목표(JPEG 노이즈로 1% 미만 차이는 허용).
 
-### Phase 4: 코어 디코더 `qrdec.c` (4–6세션, 최대 위험)
+### Phase 4: 코어 디코더 `qrdec.c` (5–7세션, 최대 위험)
 
-3,956줄을 하위 단계로 분할. 각 하위 단계마다 중간 산출물 검증.
+Phase 0 의존 그래프 분석으로 8단계 → **3 모듈로 재편**.
+`qr_finder_ransac` ↔ `qr_finder_edge_pts_aff_classify` 역의존 때문에 4b~4d를
+쪼개면 단계별 검증이 불가능. 같은 `qr_finder` 구조체가 B→C→D를 관통한다.
 
-- **4a. 자료구조 (~400줄)**: `QrReader`, `QrFinder`, `QrAff` (affine 변환),
-  `QrHom` (homography). 메모리 레이아웃만 옮기고 함수는 stub.
-- **4b. Finder 클러스터링 (~500줄)**: 1D 라인들을 finder 3개 그룹으로 묶기.
-  검증: 07 샘플에서 finder center 3개 좌표가 zbar C와 ±1px 일치.
-- **4c. Alignment pattern + version 결정 (~400줄)**.
-  검증: version 추출 결과 동일.
-- **4d. Homography + 그리드 샘플링 (~700줄)**.
-  검증: 추출된 비트 그리드를 PNG로 덤프 → zbar C 결과와 비교.
-- **4e. Format info + mask 디코딩, 데이터 비트 추출 (~500줄)**.
-  검증: format info 비트 패턴 일치.
-- **4f. RS 디코딩 호출, 코드워드 → 비트스트림 (~400줄)**.
-  검증: raw 코드워드 / RS 정정 후 비트스트림 동일.
-- **4g. 페이로드 모드별 추출 (~600줄)**: numeric / alphanumeric / byte /
-  kanji. 검증: 07 샘플 `HALFIN;...` 텍스트 완전 일치.
-- **4h. Structured Append (~400줄)**: **스킵**. stub만.
+- **4-G. Geometry (~600줄, 1세션)**: `qr_point_*`, `qr_line_*`, `qr_aff_*`,
+  `qr_hom_*`. 순수 함수. 다른 그룹 의존 없음.
+  검증: 단위 테스트 (입출력 비교).
+- **4-F. Finder + Transform (~1300줄, 2–3세션, 한 PR로 묶음)**:
+  finder 클러스터링, RANSAC, alignment, version 결정, homography fit,
+  format info + bch18_6 + bch15_5 호출.
+  검증: 07 샘플에서 finder center 3개 좌표 ±1px 일치, version 추출, format
+  info 비트 패턴 일치. Phase 0의 instrumented C 빌드와 중간값 라인 diff.
+- **4-D. Decode + Parse (~1500줄, 2–3세션)**: 그리드 샘플링,
+  `qr_data_mask_fill`, `qr_samples_unpack`, `qr_code_decode` → `rs_correct`,
+  `qr_code_data_parse` (numeric / alphanumeric / byte / kanji /
+  **structured append** 전체).
+  검증: 코드워드 / RS 정정 후 비트스트림 동일, 07 샘플 `HALFIN;...` 완전 일치.
 
-위험 분기: 4a 끝났는데 4b~4d의 자료구조 결합도가 너무 높아 단계 검증이
-불가능해 보이면 **빅뱅 포팅(전체 한 번에 옮기고 끝)** 으로 전환 가능성.
-판단 시점은 4a 종료 후.
+빅뱅 전환 임계점: 4-G 끝나고 4-F 안에서 데이터 구조 결합이 예상보다 심해
+한 PR로도 안 끝나면, 4-F를 통째로 한 번에 옮기는 빅뱅 모드 전환.
+판단 시점은 4-G 종료 후.
 
 ### Phase 5: 텍스트 변환 (1세션)
 
