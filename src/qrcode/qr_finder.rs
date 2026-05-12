@@ -9,11 +9,12 @@
 
 use super::finder_centers::{QrFinderCenter, QrFinderEdgePt};
 use super::geom::{
-    qr_aff_unproject, qr_hom_unproject, qr_point_ccw, qr_point_distance2,
-    qr_point_translate, QrAff, QrHom, QrPoint, QR_FINDER_SUBPREC,
+    qr_aff_project, qr_aff_unproject, qr_hom_unproject, qr_line_fit_points,
+    qr_line_orient, qr_point_ccw, qr_point_distance2, qr_point_translate,
+    QrAff, QrHom, QrLine, QrPoint, QR_FINDER_SUBPREC, QR_INT_BITS,
 };
 use super::isaac::{isaac_next_uint, IsaacCtx};
-use super::util::{qr_divround, qr_isqrt};
+use super::util::{qr_clampi, qr_divround, qr_ilog, qr_isqrt, qr_maxi};
 
 /// Slack tolerated between the two axes' estimated version numbers.
 pub const QR_LARGE_VERSION_SLACK: i32 = 3;
@@ -303,6 +304,206 @@ pub fn qr_finder_ransac(finder: &mut QrFinder, aff: &QrAff, isaac: &mut IsaacCtx
     finder.ninliers[e] = best_ninliers;
 }
 
+/// Least-squares line fit to one edge using RANSAC inliers (qrdec.c:1122).
+/// Returns `-1` when fewer than 2 inliers are available, `0` on success.
+pub fn qr_line_fit_finder_edge(l: &mut QrLine, finder: &QrFinder, e: usize, res: i32) -> i32 {
+    let npts = finder.ninliers[e];
+    if npts < 2 { return -1; }
+    let edge_pts = finder.edge_slice(e);
+    let pts: Vec<QrPoint> = edge_pts.iter().take(npts as usize).map(|ep| ep.pos).collect();
+    qr_line_fit_points(l, &pts, res);
+    qr_line_orient(l, finder.center_pos[0], finder.center_pos[1]);
+    0
+}
+
+/// Least-squares line fit to a pair of finders' common edge (qrdec.c:1152).
+/// Synthesizes one point per finder when an edge has no inliers — that way
+/// this routine always produces a line, unlike `qr_line_fit_finder_edge`.
+pub fn qr_line_fit_finder_pair(
+    l: &mut QrLine,
+    aff: &QrAff,
+    f0: &QrFinder,
+    f1: &QrFinder,
+    e: usize,
+) {
+    let n0_in = f0.ninliers[e];
+    let n1_in = f1.ninliers[e];
+    let npts_max = (n0_in.max(1) + n1_in.max(1)) as usize;
+    let mut pts: Vec<QrPoint> = Vec::with_capacity(npts_max);
+
+    let edge_axis = e >> 1;
+    let edge_dir = 2 * ((e & 1) as i32) - 1; // -1 for negative edges, +1 for positive
+
+    let n0_eff;
+    if n0_in > 0 {
+        let edge_pts = f0.edge_slice(e);
+        for ep in edge_pts.iter().take(n0_in as usize) {
+            pts.push(ep.pos);
+        }
+        n0_eff = n0_in as usize;
+    } else {
+        let mut q: QrPoint = f0.o;
+        q[edge_axis] += f0.size[edge_axis] * edge_dir;
+        let mut p: QrPoint = [0; 2];
+        qr_aff_project(&mut p, aff, q[0], q[1]);
+        pts.push(p);
+        n0_eff = 1;
+    }
+    if n1_in > 0 {
+        let edge_pts = f1.edge_slice(e);
+        for ep in edge_pts.iter().take(n1_in as usize) {
+            pts.push(ep.pos);
+        }
+    } else {
+        let mut q: QrPoint = f1.o;
+        q[edge_axis] += f1.size[edge_axis] * edge_dir;
+        let mut p: QrPoint = [0; 2];
+        qr_aff_project(&mut p, aff, q[0], q[1]);
+        pts.push(p);
+    }
+    let _ = n0_eff; // pts already laid out correctly
+    qr_line_fit_points(l, &pts, aff.res);
+    qr_line_orient(l, f0.center_pos[0], f0.center_pos[1]);
+}
+
+/// Quick !v:v:!v pattern check at the endpoints + midpoint of a line
+/// (qrdec.c:1202). Returns `-1` when the region should be considered
+/// empty, `0` when the pattern looks valid, `1` when the endpoints fail.
+pub fn qr_finder_quick_crossing_check(
+    img: &[u8],
+    width: i32,
+    height: i32,
+    x0: i32, y0: i32, x1: i32, y1: i32,
+    v: i32,
+) -> i32 {
+    if x0 < 0 || x0 >= width || y0 < 0 || y0 >= height
+        || x1 < 0 || x1 >= width || y1 < 0 || y1 >= height
+    {
+        return -1;
+    }
+    let w = width as usize;
+    let p0 = img[y0 as usize * w + x0 as usize];
+    let p1 = img[y1 as usize * w + x1 as usize];
+    // C: !pixel evaluates to 0 (pixel != 0) or 1 (pixel == 0).
+    let np0 = if p0 == 0 { 1 } else { 0 };
+    let np1 = if p1 == 0 { 1 } else { 0 };
+    if np0 != v || np1 != v { return 1; }
+    let mx = ((x0 + x1) >> 1) as usize;
+    let my = ((y0 + y1) >> 1) as usize;
+    let pm = img[my * w + mx];
+    let npm = if pm == 0 { 1 } else { 0 };
+    // C: `!_img != _v == ...` — translates to "midpoint matches !_v" check.
+    // zbar wrote `!_img == _v` which is "midpoint equals !_v means v sandwich
+    // is absent" — return -1.
+    if npm == v { return -1; }
+    0
+}
+
+/// Find the midpoint of a `!_v:_v:!_v` segment from (x0,y0) to (x1,y1)
+/// using a Bresenham trace (qrdec.c:1225). Returns the (subpixel) midpoint
+/// in `p` and `0` on success; `-1` if no crossing was detected.
+#[allow(clippy::too_many_arguments)]
+pub fn qr_finder_locate_crossing(
+    img: &[u8],
+    width: i32,
+    _height: i32,
+    x0_in: i32, y0_in: i32,
+    x1_in: i32, y1_in: i32,
+    v: i32,
+    p: &mut QrPoint,
+) -> i32 {
+    let w_usize = width as usize;
+    let mut x0 = [x0_in, y0_in];
+    let mut x1 = [x1_in, y1_in];
+    let dx = [(x1_in - x0_in).abs(), (y1_in - y0_in).abs()];
+    let steep: usize = if dx[1] > dx[0] { 1 } else { 0 };
+    let other = 1 - steep;
+    let derr = dx[other];
+    let step = [
+        if x0_in < x1_in { 1 } else { -1 },
+        if y0_in < y1_in { 1 } else { -1 },
+    ];
+    let pixel = |x: i32, y: i32| -> i32 {
+        let b = img[y as usize * w_usize + x as usize];
+        if b == 0 { 1 } else { 0 }
+    };
+
+    // First crossing from !v to v.
+    let mut err = 0i32;
+    loop {
+        if x0[steep] == x1[steep] { return -1; }
+        x0[steep] += step[steep];
+        err += derr;
+        if err << 1 > dx[steep] {
+            x0[other] += step[other];
+            err -= dx[steep];
+        }
+        if pixel(x0[0], x0[1]) == v { break; }
+    }
+    // Last crossing from v to !v, scanning from the far end.
+    err = 0;
+    loop {
+        if x0[steep] == x1[steep] { break; }
+        x1[steep] -= step[steep];
+        err += derr;
+        if err << 1 > dx[steep] {
+            x1[other] -= step[other];
+            err -= dx[steep];
+        }
+        if pixel(x1[0], x1[1]) == v { break; }
+    }
+    // Midpoint in subpixel resolution: ((x0+x1+1) << SUBPREC) >> 1
+    p[0] = (x0[0] + x1[0] + 1).wrapping_shl(QR_FINDER_SUBPREC as u32) >> 1;
+    p[1] = (x0[1] + x1[1] + 1).wrapping_shl(QR_FINDER_SUBPREC as u32) >> 1;
+    0
+}
+
+/// Compute a step `dv` along axis `v` of the square domain such that
+/// stepping `du` along the other axis after applying the affine produces
+/// a corresponding image-space move along line `l` (qrdec.c:1277).
+/// Returns `-1` when the line is too tilted (≥ 45° off the axis).
+pub fn qr_aff_line_step(
+    aff: &QrAff, l: &QrLine, v: usize, du: i32, dv: &mut i32,
+) -> i32 {
+    let other = 1 - v;
+    let mut n = aff.fwd[0][v].wrapping_mul(l[0]).wrapping_add(aff.fwd[1][v].wrapping_mul(l[1]));
+    let mut d = aff.fwd[0][other].wrapping_mul(l[0]).wrapping_add(aff.fwd[1][other].wrapping_mul(l[1]));
+    if d < 0 { n = -n; d = -d; }
+    let shift = qr_maxi(0, qr_ilog(du as u32) + qr_ilog(n.unsigned_abs()) + 3 - QR_INT_BITS);
+    let round = (1i32 << shift) >> 1;
+    n = n.wrapping_add(round) >> shift;
+    d = d.wrapping_add(round) >> shift;
+    if n.abs() >= d { return -1; }
+    n = (-du).wrapping_mul(n);
+    let dvv = qr_divround(n, d);
+    if dvv.abs() >= du { return -1; }
+    *dv = dvv;
+    0
+}
+
+/// Bit-count of `y1 ^ y2`, capped at `maxdiff` (qrdec.c:1309).
+#[inline]
+pub fn qr_hamming_dist(y1: u32, y2: u32, maxdiff: i32) -> i32 {
+    let mut y = y1 ^ y2;
+    let mut ret = 0i32;
+    while ret < maxdiff && y != 0 {
+        y &= y - 1;
+        ret += 1;
+    }
+    ret
+}
+
+/// Sample a 0/1 bit from the binarized image (qrdec.c:1319). Coordinates
+/// are in subpixel resolution and get clamped to the image bounds.
+#[inline]
+pub fn qr_img_get_bit(img: &[u8], width: i32, height: i32, x: i32, y: i32) -> i32 {
+    let xb = x >> QR_FINDER_SUBPREC;
+    let yb = y >> QR_FINDER_SUBPREC;
+    let xc = qr_clampi(0, xb, width - 1) as usize;
+    let yc = qr_clampi(0, yb, height - 1) as usize;
+    (img[yc * width as usize + xc] != 0) as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,6 +577,56 @@ mod tests {
         isaac_init_empty(&mut isaac);
         qr_finder_ransac(&mut f, &aff, &mut isaac, 0);
         assert_eq!(f.ninliers[0], 0);
+    }
+
+    #[test]
+    fn hamming_dist_basic() {
+        assert_eq!(qr_hamming_dist(0b0000, 0b0000, 10), 0);
+        assert_eq!(qr_hamming_dist(0b1111, 0b0000, 10), 4);
+        assert_eq!(qr_hamming_dist(0xFFFFFFFF, 0x0, 10), 10); // capped at maxdiff
+        assert_eq!(qr_hamming_dist(0xF0, 0x0F, 10), 8);
+    }
+
+    #[test]
+    fn img_get_bit_clamps_out_of_bounds() {
+        // 4x4 binarized: top row all 0xFF, rest 0.
+        let img = vec![
+            0xFF, 0xFF, 0xFF, 0xFF,
+            0, 0, 0, 0,
+            0, 0, 0, 0,
+            0, 0, 0, 0,
+        ];
+        // x, y already shifted left by SUBPREC.
+        let shift = QR_FINDER_SUBPREC;
+        assert_eq!(qr_img_get_bit(&img, 4, 4, 0 << shift, 0 << shift), 1);
+        assert_eq!(qr_img_get_bit(&img, 4, 4, 0 << shift, 1 << shift), 0);
+        // Out-of-bounds gets clamped to nearest valid pixel.
+        assert_eq!(qr_img_get_bit(&img, 4, 4, -100 << shift, -100 << shift), 1);
+        assert_eq!(qr_img_get_bit(&img, 4, 4, 100 << shift, 100 << shift), 0);
+    }
+
+    #[test]
+    fn aff_line_step_rejects_steep_line() {
+        let res = 8;
+        let mut aff = QrAff::zero();
+        qr_aff_init(&mut aff,
+            &[0, 0], &[1 << res, 0], &[0, 1 << res], res);
+        // Vertical line x=0  (1*x + 0*y + 0 = 0).
+        let l: QrLine = [1, 0, 0];
+        let mut dv = 0;
+        // Stepping along axis v=0 (x) on a vertical line is impossible (>45°).
+        assert_eq!(qr_aff_line_step(&aff, &l, 0, 1 << 4, &mut dv), -1);
+    }
+
+    #[test]
+    fn quick_crossing_check_endpoints_in_image() {
+        // Build a tiny 1D pattern: light, dark, dark, light (background, fg, fg, bg).
+        let img = vec![0, 0xFF, 0xFF, 0];
+        // Endpoints at (0, 0) and (3, 0); looking for "dark" middle (v=0).
+        // p0 == 0 (light) → np0 = 1. p1 == 0 → np1 = 1. v = 0 → np != v
+        // returns 1 (endpoints don't match !v=non-dark).
+        let r = qr_finder_quick_crossing_check(&img, 4, 1, 0, 0, 3, 0, 0);
+        assert!(r >= 0); // not the -1 out-of-image bail-out
     }
 
     #[test]
