@@ -3,6 +3,7 @@
 //! Original Copyright (C) 2008-2009 Timothy B. Terriberry (tterribe@xiph.org)
 //! LGPL-2.1-or-later
 
+pub mod alignment;
 pub mod bch15_5;
 pub mod binarize;
 pub mod finder;
