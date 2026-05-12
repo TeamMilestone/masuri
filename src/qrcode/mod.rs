@@ -6,6 +6,7 @@
 pub mod alignment;
 pub mod bch15_5;
 pub mod binarize;
+pub mod decode;
 pub mod finder;
 pub mod finder_centers;
 pub mod geom;
