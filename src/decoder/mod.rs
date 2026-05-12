@@ -8,7 +8,7 @@ pub mod code128;
 pub mod i25;
 
 use crate::SymbolType;
-use crate::qrcode::finder::{QrFinderLine, QrFinderState};
+use crate::qrcode::finder::QrFinderState;
 
 const DECODE_WINDOW: usize = 16;
 const BUFFER_MIN: usize = 0x20;
@@ -45,8 +45,6 @@ pub struct Decoder {
 
     // Collected results for current scan line
     pub results: Vec<DecodedSymbol>,
-    // QR finder lines detected on this scan line (width-units; subpixel fixup in Phase 4-F).
-    pub qr_lines: Vec<QrFinderLine>,
 
     // Position tracking (set by img_scanner before scanning)
     pub scanline_coord: u32,  // row scan: y, col scan: x (exact axis)
@@ -68,7 +66,6 @@ impl Decoder {
             i25: i25::I25Decoder::new(),
             qr: QrFinderState::new(),
             results: Vec::new(),
-            qr_lines: Vec::new(),
             scanline_coord: 0,
             cross_offset: 0,
             is_row_scan: true,
@@ -179,9 +176,11 @@ impl Decoder {
         false
     }
 
-    /// Process one bar/space width through all enabled decoders
+    /// Process one bar/space width through all enabled decoders.
+    /// Returns `true` if a QR finder pattern was detected on this width
+    /// (caller reads `self.qr.line` for the width-unit coordinates).
     #[inline(always)]
-    pub fn decode_width(&mut self, width: u32) {
+    pub fn decode_width(&mut self, width: u32) -> bool {
         self.w[(self.idx as usize) & (DECODE_WINDOW - 1)] = width;
         self.sym_type = SymbolType::None;
 
@@ -212,13 +211,12 @@ impl Decoder {
             }
         }
 
-        // QR finder line detector (1:1:3:1:1). Always-on for now; gate behind config in Phase 6.
-        // Accumulates lines in self.qr_lines but does not update sym_type — keeps the 1D
-        // collection branch below untouched. zbar's `qr_handler` (subpixel fixup + direction
-        // swap) runs in img_scanner during Phase 4-F.
-        if self.find_qr() {
-            self.qr_lines.push(self.qr.line.clone());
-        }
+        // QR finder line detector (1:1:3:1:1). Always-on for now.
+        // Returned to caller; doesn't update sym_type — the 1D collection
+        // branch below stays untouched. img_scanner runs the qr_handler
+        // (subpixel fixup + direction-aware swap) and pushes into the
+        // image-level h/v line vectors.
+        let qr_found = self.find_qr();
 
         self.idx = self.idx.wrapping_add(1);
 
@@ -240,6 +238,7 @@ impl Decoder {
                 self.lock = SymbolType::None;
             }
         }
+        qr_found
     }
 }
 

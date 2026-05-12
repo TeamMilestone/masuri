@@ -16,6 +16,7 @@ pub mod orchestrator;
 pub mod qr_finder;
 pub mod rs;
 pub mod sampling_grid;
+pub mod scanner_fixup;
 pub mod text;
 pub mod util;
 pub mod version_info;

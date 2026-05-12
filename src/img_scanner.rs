@@ -4,18 +4,89 @@
 use crate::{Decoded, SymbolType};
 use crate::scanner::Scanner;
 use crate::decoder::{Decoder, DecodedSymbol};
+use crate::qrcode::finder::QrFinderLine;
+use crate::qrcode::scanner_fixup::qr_handler_fixup;
 use rayon::prelude::*;
 use std::collections::HashMap;
+
+/// Full QR pipeline: cluster finder lines into centers, binarize the image,
+/// run the orchestrator + text extractor, return one `Decoded` per QR.
+/// Empty Vec when fewer than 9 finder lines have accumulated in either
+/// direction (mirrors zbar's early-out in `_zbar_qr_decode`).
+fn decode_qr_codes(
+    gray: &[u8], width: i32, height: i32,
+    hlines: &mut Vec<QrFinderLine>, vlines: &mut Vec<QrFinderLine>,
+) -> Vec<Decoded> {
+    if hlines.len() < 9 || vlines.len() < 9 { return Vec::new(); }
+    use crate::qrcode::binarize::qr_binarize;
+    use crate::qrcode::finder_centers::qr_finder_centers_locate;
+    use crate::qrcode::isaac::{isaac_init_empty, IsaacCtx};
+    use crate::qrcode::orchestrator::decode_image;
+    use crate::qrcode::rs::RsGf256;
+    use crate::qrcode::text::qr_code_data_list_extract_text;
+
+    let centers = qr_finder_centers_locate(hlines, vlines);
+    if centers.len() < 3 { return Vec::new(); }
+    let bin = qr_binarize(gray, width, height);
+    let gf = RsGf256::new();
+    let mut isaac = IsaacCtx::new();
+    isaac_init_empty(&mut isaac);
+    let qrlist = decode_image(&gf, &mut isaac, &centers, &bin, width, height);
+    let payloads = qr_code_data_list_extract_text(&qrlist);
+
+    let mut out = Vec::with_capacity(payloads.len());
+    for (text, indices) in payloads {
+        // Use bounding-box centroid for x/y (first QR if SA group).
+        let primary = indices[0];
+        let bbox = qrlist[primary].bbox;
+        let cx = (bbox[0][0] + bbox[1][0] + bbox[2][0] + bbox[3][0]) / 4;
+        let cy = (bbox[0][1] + bbox[1][1] + bbox[2][1] + bbox[3][1]) / 4;
+        out.push(Decoded {
+            data: text,
+            sym_type: SymbolType::QrCode,
+            quality: indices.len() as i32,
+            x: cx.max(0) as u32,
+            y: cy.max(0) as u32,
+        });
+    }
+    out
+}
+
+/// Run one decode_width call, then if a QR finder was detected, apply the
+/// subpixel fixup and push into the appropriate (h or v) line vector.
+#[inline(always)]
+fn decode_width_and_capture(
+    dcode: &mut Decoder,
+    scn: &Scanner,
+    width: u32,
+    forward: bool,
+    scanline_pixel: i32,
+    umin: i32,
+    is_row: bool,
+    qr_lines: &mut Vec<QrFinderLine>,
+) {
+    if dcode.decode_width(width) {
+        let fixed = qr_handler_fixup(
+            &dcode.qr.line, scn, forward, scanline_pixel, umin, is_row,
+        );
+        qr_lines.push(fixed);
+    }
+}
 
 /// Scan a single image (single-threaded)
 pub fn scan_image(gray: &[u8], width: u32, height: u32) -> Vec<Decoded> {
     let mut scn = Scanner::new();
     let mut dcode = Decoder::new();
+    let mut hlines: Vec<QrFinderLine> = Vec::new();
+    let mut vlines: Vec<QrFinderLine> = Vec::new();
 
-    scan_rows(gray, width, height, &mut scn, &mut dcode, 1);
-    scan_cols(gray, width, height, &mut scn, &mut dcode, 1);
+    scan_rows(gray, width, height, &mut scn, &mut dcode, 1, &mut hlines);
+    scan_cols(gray, width, height, &mut scn, &mut dcode, 1, &mut vlines);
 
-    dedup_results(&dcode.results)
+    let mut out = dedup_results(&dcode.results);
+    let qr_results = decode_qr_codes(gray, width as i32, height as i32, &mut hlines, &mut vlines);
+    out.extend(qr_results);
+    out
 }
 
 /// Scan a single image with parallel row scanning
@@ -76,31 +147,43 @@ fn scan_at_scale(gray: &[u8], w: usize, h: usize) -> Vec<Decoded> {
     let num_rows = row_indices.len();
     let total = num_rows + col_indices.len();
 
-    let all_results: Vec<Vec<DecodedSymbol>> = (0..total)
+    let all_results: Vec<(Vec<DecodedSymbol>, Vec<QrFinderLine>, Vec<QrFinderLine>)> =
+        (0..total)
         .into_par_iter()
         .map(|i| {
             let mut scn = Scanner::new();
             let mut dcode = Decoder::new();
+            let mut hl: Vec<QrFinderLine> = Vec::new();
+            let mut vl: Vec<QrFinderLine> = Vec::new();
             if i < num_rows {
                 let y = row_indices[i];
-                scan_single_row(gray, w, y, true, &mut scn, &mut dcode);
+                scan_single_row(gray, w, y, true, &mut scn, &mut dcode, &mut hl);
                 scn.new_scan();
                 dcode.new_scan();
-                scan_single_row(gray, w, y, false, &mut scn, &mut dcode);
+                scan_single_row(gray, w, y, false, &mut scn, &mut dcode, &mut hl);
             } else {
                 let x = col_indices[i - num_rows];
-                scan_single_col(gray, w, h, x, true, &mut scn, &mut dcode);
+                scan_single_col(gray, w, h, x, true, &mut scn, &mut dcode, &mut vl);
                 scn.new_scan();
                 dcode.new_scan();
-                scan_single_col(gray, w, h, x, false, &mut scn, &mut dcode);
+                scan_single_col(gray, w, h, x, false, &mut scn, &mut dcode, &mut vl);
             }
-            dcode.results
+            (dcode.results, hl, vl)
         })
         .collect();
 
     let mut results: Vec<DecodedSymbol> = Vec::new();
-    for r in all_results { results.extend(r); }
-    dedup_results(&results)
+    let mut hlines: Vec<QrFinderLine> = Vec::new();
+    let mut vlines: Vec<QrFinderLine> = Vec::new();
+    for (r, hl, vl) in all_results {
+        results.extend(r);
+        hlines.extend(hl);
+        vlines.extend(vl);
+    }
+    let mut out = dedup_results(&results);
+    let qr_results = decode_qr_codes(gray, w as i32, h as i32, &mut hlines, &mut vlines);
+    out.extend(qr_results);
+    out
 }
 
 fn rescale(gray: &[u8], w: usize, h: usize, pct: usize) -> Vec<u8> {
@@ -112,11 +195,17 @@ fn rescale(gray: &[u8], w: usize, h: usize, pct: usize) -> Vec<u8> {
     resized.into_raw()
 }
 
-fn scan_single_row(gray: &[u8], w: usize, y: usize, forward: bool, scn: &mut Scanner, dcode: &mut Decoder) {
+fn scan_single_row(
+    gray: &[u8], w: usize, y: usize, forward: bool,
+    scn: &mut Scanner, dcode: &mut Decoder,
+    hlines: &mut Vec<QrFinderLine>,
+) {
     scn.new_scan();
     dcode.new_scan();
     dcode.scanline_coord = y as u32;
     dcode.is_row_scan = true;
+    let umin = if forward { 0i32 } else { (w as i32) - 1 };
+    let v = y as i32;
 
     if forward {
         for x in 0..w {
@@ -124,7 +213,7 @@ fn scan_single_row(gray: &[u8], w: usize, y: usize, forward: bool, scn: &mut Sca
             let result = scn.scan_y(d);
             if result.edge != crate::scanner::EdgeType::None {
                 dcode.cross_offset = x as u32;
-                dcode.decode_width(result.width);
+                decode_width_and_capture(dcode, scn, result.width, forward, v, umin, true, hlines);
             }
         }
     } else {
@@ -133,24 +222,33 @@ fn scan_single_row(gray: &[u8], w: usize, y: usize, forward: bool, scn: &mut Sca
             let result = scn.scan_y(d);
             if result.edge != crate::scanner::EdgeType::None {
                 dcode.cross_offset = x as u32;
-                dcode.decode_width(result.width);
+                decode_width_and_capture(dcode, scn, result.width, forward, v, umin, true, hlines);
             }
         }
     }
     // quiet_border: flush + flush + new_scan (matches C zbar)
     let r = scn.flush();
-    if r.edge != crate::scanner::EdgeType::None { dcode.decode_width(r.width); }
+    if r.edge != crate::scanner::EdgeType::None {
+        decode_width_and_capture(dcode, scn, r.width, forward, v, umin, true, hlines);
+    }
     let r = scn.flush();
-    if r.edge != crate::scanner::EdgeType::None { dcode.decode_width(r.width); }
-    // C zbar sends width=0 on final flush to signal end of scan line
-    dcode.decode_width(0);
+    if r.edge != crate::scanner::EdgeType::None {
+        decode_width_and_capture(dcode, scn, r.width, forward, v, umin, true, hlines);
+    }
+    decode_width_and_capture(dcode, scn, 0, forward, v, umin, true, hlines);
 }
 
-fn scan_single_col(gray: &[u8], w: usize, h: usize, x: usize, forward: bool, scn: &mut Scanner, dcode: &mut Decoder) {
+fn scan_single_col(
+    gray: &[u8], w: usize, h: usize, x: usize, forward: bool,
+    scn: &mut Scanner, dcode: &mut Decoder,
+    vlines: &mut Vec<QrFinderLine>,
+) {
     scn.new_scan();
     dcode.new_scan();
     dcode.scanline_coord = x as u32;
     dcode.is_row_scan = false;
+    let umin = if forward { 0i32 } else { (h as i32) - 1 };
+    let v = x as i32;
 
     if forward {
         for y in 0..h {
@@ -158,7 +256,7 @@ fn scan_single_col(gray: &[u8], w: usize, h: usize, x: usize, forward: bool, scn
             let result = scn.scan_y(d);
             if result.edge != crate::scanner::EdgeType::None {
                 dcode.cross_offset = y as u32;
-                dcode.decode_width(result.width);
+                decode_width_and_capture(dcode, scn, result.width, forward, v, umin, false, vlines);
             }
         }
     } else {
@@ -167,18 +265,26 @@ fn scan_single_col(gray: &[u8], w: usize, h: usize, x: usize, forward: bool, scn
             let result = scn.scan_y(d);
             if result.edge != crate::scanner::EdgeType::None {
                 dcode.cross_offset = y as u32;
-                dcode.decode_width(result.width);
+                decode_width_and_capture(dcode, scn, result.width, forward, v, umin, false, vlines);
             }
         }
     }
     let r = scn.flush();
-    if r.edge != crate::scanner::EdgeType::None { dcode.decode_width(r.width); }
+    if r.edge != crate::scanner::EdgeType::None {
+        decode_width_and_capture(dcode, scn, r.width, forward, v, umin, false, vlines);
+    }
     let r = scn.flush();
-    if r.edge != crate::scanner::EdgeType::None { dcode.decode_width(r.width); }
-    dcode.decode_width(0);
+    if r.edge != crate::scanner::EdgeType::None {
+        decode_width_and_capture(dcode, scn, r.width, forward, v, umin, false, vlines);
+    }
+    decode_width_and_capture(dcode, scn, 0, forward, v, umin, false, vlines);
 }
 
-fn scan_rows(gray: &[u8], width: u32, height: u32, scn: &mut Scanner, dcode: &mut Decoder, density: u32) {
+fn scan_rows(
+    gray: &[u8], width: u32, height: u32,
+    scn: &mut Scanner, dcode: &mut Decoder, density: u32,
+    hlines: &mut Vec<QrFinderLine>,
+) {
     let w = width as usize;
     let h = height as usize;
     let density = density as usize;
@@ -190,20 +296,22 @@ fn scan_rows(gray: &[u8], width: u32, height: u32, scn: &mut Scanner, dcode: &mu
     scn.new_scan();
 
     while y < h {
-        // Forward scan
-        scan_single_row(gray, w, y, true, scn, dcode);
+        scan_single_row(gray, w, y, true, scn, dcode, hlines);
 
         y += density;
         if y >= h { break; }
 
-        // Reverse scan
-        scan_single_row(gray, w, y, false, scn, dcode);
+        scan_single_row(gray, w, y, false, scn, dcode, hlines);
 
         y += density;
     }
 }
 
-fn scan_cols(gray: &[u8], width: u32, height: u32, scn: &mut Scanner, dcode: &mut Decoder, density: u32) {
+fn scan_cols(
+    gray: &[u8], width: u32, height: u32,
+    scn: &mut Scanner, dcode: &mut Decoder, density: u32,
+    vlines: &mut Vec<QrFinderLine>,
+) {
     let w = width as usize;
     let h = height as usize;
     let density = density as usize;
@@ -213,12 +321,12 @@ fn scan_cols(gray: &[u8], width: u32, height: u32, scn: &mut Scanner, dcode: &mu
     let mut x = border;
 
     while x < w {
-        scan_single_col(gray, w, h, x, true, scn, dcode);
+        scan_single_col(gray, w, h, x, true, scn, dcode, vlines);
 
         x += density;
         if x >= w { break; }
 
-        scan_single_col(gray, w, h, x, false, scn, dcode);
+        scan_single_col(gray, w, h, x, false, scn, dcode, vlines);
 
         x += density;
     }
@@ -338,10 +446,16 @@ pub fn scan_image_neon_parallel(gray: &[u8], width: u32, height: u32) -> Vec<Dec
                 ScanTask::ScalarRow(y) => {
                     let mut scn = Scanner::new();
                     let mut dcode = Decoder::new();
-                    scan_single_row(gray, w, *y, true, &mut scn, &mut dcode);
+                    let mut hl: Vec<QrFinderLine> = Vec::new();
+                    scan_single_row(gray, w, *y, true, &mut scn, &mut dcode, &mut hl);
                     scn.new_scan();
                     dcode.new_scan();
-                    scan_single_row(gray, w, *y, false, &mut scn, &mut dcode);
+                    scan_single_row(gray, w, *y, false, &mut scn, &mut dcode, &mut hl);
+                    // NEON path: QR finder lines emitted only by the scalar
+                    // fallback rows/cols. Phase 6 native-aarch64 QR is gated
+                    // behind `decode()` / `scan_image_parallel` which has the
+                    // full pipeline; the NEON entry stays 1D-only.
+                    let _ = hl;
                     dcode.results
                 }
                 ScanTask::NeonCols(batch) => {
@@ -413,10 +527,12 @@ pub fn scan_image_neon_parallel(gray: &[u8], width: u32, height: u32) -> Vec<Dec
                 ScanTask::ScalarCol(x) => {
                     let mut scn = Scanner::new();
                     let mut dcode = Decoder::new();
-                    scan_single_col(gray, w, h, *x, true, &mut scn, &mut dcode);
+                    let mut vl: Vec<QrFinderLine> = Vec::new();
+                    scan_single_col(gray, w, h, *x, true, &mut scn, &mut dcode, &mut vl);
                     scn.new_scan();
                     dcode.new_scan();
-                    scan_single_col(gray, w, h, *x, false, &mut scn, &mut dcode);
+                    scan_single_col(gray, w, h, *x, false, &mut scn, &mut dcode, &mut vl);
+                    let _ = vl;
                     dcode.results
                 }
             }
@@ -428,45 +544,50 @@ pub fn scan_image_neon_parallel(gray: &[u8], width: u32, height: u32) -> Vec<Dec
     dedup_results(&results)
 }
 
-/// Phase 1 diagnostic: single-scale parallel scan that also returns the count of
-/// QR finder lines detected (sum across all rows/cols, before any clustering).
-/// Used to verify finder-line accumulation without disturbing the production paths.
+/// Diagnostic: single-scale parallel scan that also returns the count of
+/// QR finder lines detected (sum across all rows/cols, before clustering).
 pub fn scan_image_qr_diag(gray: &[u8], width: u32, height: u32) -> (Vec<Decoded>, usize) {
     let w = width as usize;
     let h = height as usize;
 
-    let row_outputs: Vec<(Vec<DecodedSymbol>, usize)> = (0..h)
+    let row_outputs: Vec<(Vec<DecodedSymbol>, Vec<QrFinderLine>)> = (0..h)
         .into_par_iter()
         .map(|y| {
             let mut scn = Scanner::new();
             let mut dcode = Decoder::new();
-            scan_single_row(gray, w, y, true, &mut scn, &mut dcode);
+            let mut hl: Vec<QrFinderLine> = Vec::new();
+            scan_single_row(gray, w, y, true, &mut scn, &mut dcode, &mut hl);
             scn.new_scan();
             dcode.new_scan();
-            scan_single_row(gray, w, y, false, &mut scn, &mut dcode);
-            (dcode.results, dcode.qr_lines.len())
+            scan_single_row(gray, w, y, false, &mut scn, &mut dcode, &mut hl);
+            (dcode.results, hl)
         })
         .collect();
 
-    let col_outputs: Vec<(Vec<DecodedSymbol>, usize)> = (0..w)
+    let col_outputs: Vec<(Vec<DecodedSymbol>, Vec<QrFinderLine>)> = (0..w)
         .into_par_iter()
         .map(|x| {
             let mut scn = Scanner::new();
             let mut dcode = Decoder::new();
-            scan_single_col(gray, w, h, x, true, &mut scn, &mut dcode);
+            let mut vl: Vec<QrFinderLine> = Vec::new();
+            scan_single_col(gray, w, h, x, true, &mut scn, &mut dcode, &mut vl);
             scn.new_scan();
             dcode.new_scan();
-            scan_single_col(gray, w, h, x, false, &mut scn, &mut dcode);
-            (dcode.results, dcode.qr_lines.len())
+            scan_single_col(gray, w, h, x, false, &mut scn, &mut dcode, &mut vl);
+            (dcode.results, vl)
         })
         .collect();
 
     let mut results: Vec<DecodedSymbol> = Vec::new();
-    let mut qr_total = 0usize;
-    for (r, c) in row_outputs { results.extend(r); qr_total += c; }
-    for (r, c) in col_outputs { results.extend(r); qr_total += c; }
-
-    (dedup_results(&results), qr_total)
+    let mut hlines: Vec<QrFinderLine> = Vec::new();
+    let mut vlines: Vec<QrFinderLine> = Vec::new();
+    for (r, hl) in row_outputs { results.extend(r); hlines.extend(hl); }
+    for (r, vl) in col_outputs { results.extend(r); vlines.extend(vl); }
+    let qr_total = hlines.len() + vlines.len();
+    let mut out = dedup_results(&results);
+    let qr_results = decode_qr_codes(gray, width as i32, height as i32, &mut hlines, &mut vlines);
+    out.extend(qr_results);
+    (out, qr_total)
 }
 
 fn dedup_results(results: &[DecodedSymbol]) -> Vec<Decoded> {
@@ -487,6 +608,7 @@ fn dedup_results(results: &[DecodedSymbol]) -> Vec<Decoded> {
                 13 => SymbolType::Ean13,
                 14 => SymbolType::Isbn13,
                 25 => SymbolType::I25,
+                64 => SymbolType::QrCode,
                 128 => SymbolType::Code128,
                 _ => SymbolType::None,
             };
