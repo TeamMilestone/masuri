@@ -6,6 +6,7 @@
 pub mod bch15_5;
 pub mod binarize;
 pub mod finder;
+pub mod geom;
 pub mod isaac;
 pub mod rs;
 pub mod util;
