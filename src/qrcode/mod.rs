@@ -14,3 +14,4 @@ pub mod isaac;
 pub mod qr_finder;
 pub mod rs;
 pub mod util;
+pub mod version_info;
