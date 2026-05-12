@@ -12,6 +12,7 @@ pub mod finder_centers;
 pub mod geom;
 pub mod hom_fit;
 pub mod isaac;
+pub mod orchestrator;
 pub mod qr_finder;
 pub mod rs;
 pub mod sampling_grid;
