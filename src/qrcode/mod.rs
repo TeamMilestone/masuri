@@ -5,4 +5,5 @@
 
 pub mod bch15_5;
 pub mod finder;
+pub mod isaac;
 pub mod util;
