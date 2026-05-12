@@ -4,6 +4,7 @@
 //! LGPL-2.1-or-later
 
 pub mod bch15_5;
+pub mod binarize;
 pub mod finder;
 pub mod isaac;
 pub mod rs;
