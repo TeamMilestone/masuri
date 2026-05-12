@@ -12,6 +12,7 @@ pub mod scanner;
 pub mod scanner_neon;
 pub mod decoder;
 pub mod img_scanner;
+pub mod qrcode;
 #[cfg(feature = "python")]
 mod python;
 
@@ -45,6 +46,7 @@ pub enum SymbolType {
     Isbn13 = 14,
     I25 = 25,
     Code39 = 39,
+    QrCode = 64,
     Code128 = 128,
 }
 
@@ -63,6 +65,7 @@ impl std::fmt::Display for SymbolType {
             SymbolType::Isbn13 => write!(f, "ISBN-13"),
             SymbolType::I25 => write!(f, "I2/5"),
             SymbolType::Code39 => write!(f, "CODE-39"),
+            SymbolType::QrCode => write!(f, "QR-Code"),
             SymbolType::Code128 => write!(f, "CODE-128"),
         }
     }

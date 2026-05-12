@@ -428,6 +428,47 @@ pub fn scan_image_neon_parallel(gray: &[u8], width: u32, height: u32) -> Vec<Dec
     dedup_results(&results)
 }
 
+/// Phase 1 diagnostic: single-scale parallel scan that also returns the count of
+/// QR finder lines detected (sum across all rows/cols, before any clustering).
+/// Used to verify finder-line accumulation without disturbing the production paths.
+pub fn scan_image_qr_diag(gray: &[u8], width: u32, height: u32) -> (Vec<Decoded>, usize) {
+    let w = width as usize;
+    let h = height as usize;
+
+    let row_outputs: Vec<(Vec<DecodedSymbol>, usize)> = (0..h)
+        .into_par_iter()
+        .map(|y| {
+            let mut scn = Scanner::new();
+            let mut dcode = Decoder::new();
+            scan_single_row(gray, w, y, true, &mut scn, &mut dcode);
+            scn.new_scan();
+            dcode.new_scan();
+            scan_single_row(gray, w, y, false, &mut scn, &mut dcode);
+            (dcode.results, dcode.qr_lines.len())
+        })
+        .collect();
+
+    let col_outputs: Vec<(Vec<DecodedSymbol>, usize)> = (0..w)
+        .into_par_iter()
+        .map(|x| {
+            let mut scn = Scanner::new();
+            let mut dcode = Decoder::new();
+            scan_single_col(gray, w, h, x, true, &mut scn, &mut dcode);
+            scn.new_scan();
+            dcode.new_scan();
+            scan_single_col(gray, w, h, x, false, &mut scn, &mut dcode);
+            (dcode.results, dcode.qr_lines.len())
+        })
+        .collect();
+
+    let mut results: Vec<DecodedSymbol> = Vec::new();
+    let mut qr_total = 0usize;
+    for (r, c) in row_outputs { results.extend(r); qr_total += c; }
+    for (r, c) in col_outputs { results.extend(r); qr_total += c; }
+
+    (dedup_results(&results), qr_total)
+}
+
 fn dedup_results(results: &[DecodedSymbol]) -> Vec<Decoded> {
     let mut groups: HashMap<(String, i32), Vec<(u32, u32)>> = HashMap::new();
     for r in results {

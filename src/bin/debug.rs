@@ -9,8 +9,8 @@ fn main() {
     let h = gray.height();
     eprintln!("Image: {}x{}", w, h);
 
-    let results = masuri::decode(gray.as_raw(), w, h);
-    eprintln!("Results: {}", results.len());
+    let (results, qr_lines) = img_scanner::scan_image_qr_diag(gray.as_raw(), w, h);
+    eprintln!("Results: {} (QR finder lines: {})", results.len(), qr_lines);
     for r in &results {
         eprintln!("  {} [{}] q={}", r.data, r.sym_type, r.quality);
     }

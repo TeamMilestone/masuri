@@ -8,6 +8,7 @@ pub mod code128;
 pub mod i25;
 
 use crate::SymbolType;
+use crate::qrcode::finder::{QrFinderLine, QrFinderState};
 
 const DECODE_WINDOW: usize = 16;
 const BUFFER_MIN: usize = 0x20;
@@ -40,9 +41,12 @@ pub struct Decoder {
     pub ean: ean::EanDecoder,
     pub code128: code128::Code128Decoder,
     pub i25: i25::I25Decoder,
+    pub qr: QrFinderState,
 
     // Collected results for current scan line
     pub results: Vec<DecodedSymbol>,
+    // QR finder lines detected on this scan line (width-units; subpixel fixup in Phase 4-F).
+    pub qr_lines: Vec<QrFinderLine>,
 
     // Position tracking (set by img_scanner before scanning)
     pub scanline_coord: u32,  // row scan: y, col scan: x (exact axis)
@@ -62,7 +66,9 @@ impl Decoder {
             ean: ean::EanDecoder::new(),
             code128: code128::Code128Decoder::new(),
             i25: i25::I25Decoder::new(),
+            qr: QrFinderState::new(),
             results: Vec::new(),
+            qr_lines: Vec::new(),
             scanline_coord: 0,
             cross_offset: 0,
             is_row_scan: true,
@@ -79,6 +85,7 @@ impl Decoder {
         self.ean.reset();
         self.code128.reset();
         self.i25.reset();
+        self.qr.reset();
     }
 
     pub fn new_scan(&mut self) {
@@ -88,6 +95,7 @@ impl Decoder {
         self.ean.new_scan();
         self.code128.reset();
         self.i25.reset();
+        self.qr.reset();
     }
 
     #[inline(always)]
@@ -120,6 +128,43 @@ impl Decoder {
         }
         self.lock = req;
         false
+    }
+
+    /// Detect a 1:1:3:1:1 QR finder pattern at the current decode window.
+    /// Mirrors `_zbar_find_qr` in zbar/decoder/qr_finder.c.
+    ///
+    /// On detection, fills `self.qr.line` in width-units (pos[0]=pos[1] until the
+    /// img_scanner applies subpixel + direction fixup) and returns true.
+    #[inline]
+    fn find_qr(&mut self) -> bool {
+        // sliding sum: drop width at offset 6, add width at offset 1
+        self.qr.s5 = self.qr.s5
+            .wrapping_sub(self.get_width(6))
+            .wrapping_add(self.get_width(1));
+        let s = self.qr.s5;
+
+        // current width must be a SPACE (color==0) and total span >= 7 modules
+        if self.get_color() != 0 || s < 7 {
+            return false;
+        }
+
+        // 1:1:3:1:1 ratio check via decode_e on consecutive pairs
+        if decode_e(self.pair_width(1), s, 7) != 0 { return false; }
+        if decode_e(self.pair_width(2), s, 7) != 2 { return false; }
+        if decode_e(self.pair_width(3), s, 7) != 2 { return false; }
+        if decode_e(self.pair_width(4), s, 7) != 0 { return false; }
+
+        // valid finder — record line in width-units
+        let qz = self.get_width(0);
+        let w1 = self.get_width(1);
+        self.qr.line.eoffs = (qz + (w1 + 1) / 2) as i32;
+        self.qr.line.len = (qz + w1 + self.get_width(2)) as i32;
+        let pos0 = self.qr.line.len + self.get_width(3) as i32;
+        self.qr.line.pos = [pos0, pos0];
+        let w5 = self.get_width(5);
+        let boffs = pos0 as u32 + self.get_width(4) + (w5 + 1) / 2;
+        self.qr.line.boffs = boffs as i32;
+        true
     }
 
     pub fn size_buf(&mut self, len: usize) -> bool {
@@ -165,6 +210,14 @@ impl Decoder {
             if sym as i32 > SymbolType::Partial as i32 {
                 self.sym_type = sym;
             }
+        }
+
+        // QR finder line detector (1:1:3:1:1). Always-on for now; gate behind config in Phase 6.
+        // Accumulates lines in self.qr_lines but does not update sym_type — keeps the 1D
+        // collection branch below untouched. zbar's `qr_handler` (subpixel fixup + direction
+        // swap) runs in img_scanner during Phase 4-F.
+        if self.find_qr() {
+            self.qr_lines.push(self.qr.line.clone());
         }
 
         self.idx = self.idx.wrapping_add(1);
