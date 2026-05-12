@@ -5,6 +5,11 @@ on a Galaxy S22 / Z Flip 5. See `wire-printer/samples/` for the originals.
 
 - Images 01–06: 롯데택배 / cupost, captured 2026-05-07. I2/5 운송장.
 - Image 07: GS25 반값택배, captured 2026-05-12. QR + 1D dual encoding.
+- Image 08: Galaxy A31 analysis-frame dump (640×480 Y-plane PGM) of the same
+  GS25 label as 07, captured 2026-05-13. Regression fixture for the NEON QR
+  pipeline (`docs/handoff-neon-qr-pipeline.md`) — frame 4 of 5 from the
+  wire-printer field session. Decodes on the scalar path but missed on the
+  NEON path before that fix.
 
 ## Symbology
 
@@ -37,6 +42,7 @@ integration.
 | 05_lotte_263733045004.jpeg | (unreadable) | Reference zbar also fails — too blurred / skewed; left in corpus as a known-hard case |
 | 06_lotte_536788954376.jpeg | `536788954376` | |
 | 07_gs25_210578897804.jpeg | `210578897804` | QR payload: `HALFIN;210578897804;V5M69;28;VV93;316;216;` — invoice is field [1]. The right-edge 1D companion goes unread by zbar (left edge has no visible 1D). |
+| 08_gs25_wp_frame4_640x480.pgm | `210578897804` | Same payload as 07 (`HALFIN;210578897804;…`), but from the camera analysis frame (Y-plane only, 640×480). Regression fixture for the NEON QR path. |
 
 ## Baseline (pre-fix)
 

@@ -373,7 +373,12 @@ pub fn scan_image_neon_parallel(gray: &[u8], width: u32, height: u32) -> Vec<Dec
     }
 
     // Single par_iter over all tasks — 4 barriers → 1
-    let all_results: Vec<Vec<DecodedSymbol>> = tasks
+    // Each task yields (1D results, horizontal QR finder lines, vertical QR finder lines).
+    // NEON 4-lane branches use NeonScanner4 for the 1D edge stream (no finder line
+    // channel), then run a scalar QR-only pass on the same 4 rows/cols so QR finder
+    // lines are still collected. The scalar pass's 1D results are discarded — 1D
+    // detections come from the NEON SIMD pass.
+    let all_results: Vec<(Vec<DecodedSymbol>, Vec<QrFinderLine>, Vec<QrFinderLine>)> = tasks
         .par_iter()
         .map(|task| {
             match task {
@@ -441,7 +446,18 @@ pub fn scan_image_neon_parallel(gray: &[u8], width: u32, height: u32) -> Vec<Dec
                         }
                         for d in &decoders { all.extend(d.results.iter().cloned()); }
                     }
-                    all
+                    // Scalar QR-only pass: re-scan each of the 4 rows to harvest
+                    // QR finder lines. 1D results from this pass are discarded.
+                    let mut hl: Vec<QrFinderLine> = Vec::new();
+                    for &y in batch.iter() {
+                        let mut scn = Scanner::new();
+                        let mut dcode = Decoder::new();
+                        scan_single_row(gray, w, y, true, &mut scn, &mut dcode, &mut hl);
+                        scn.new_scan();
+                        dcode.new_scan();
+                        scan_single_row(gray, w, y, false, &mut scn, &mut dcode, &mut hl);
+                    }
+                    (all, hl, Vec::new())
                 }
                 ScanTask::ScalarRow(y) => {
                     let mut scn = Scanner::new();
@@ -451,12 +467,7 @@ pub fn scan_image_neon_parallel(gray: &[u8], width: u32, height: u32) -> Vec<Dec
                     scn.new_scan();
                     dcode.new_scan();
                     scan_single_row(gray, w, *y, false, &mut scn, &mut dcode, &mut hl);
-                    // NEON path: QR finder lines emitted only by the scalar
-                    // fallback rows/cols. Phase 6 native-aarch64 QR is gated
-                    // behind `decode()` / `scan_image_parallel` which has the
-                    // full pipeline; the NEON entry stays 1D-only.
-                    let _ = hl;
-                    dcode.results
+                    (dcode.results, hl, Vec::new())
                 }
                 ScanTask::NeonCols(batch) => {
                     let mut all = Vec::new();
@@ -522,7 +533,18 @@ pub fn scan_image_neon_parallel(gray: &[u8], width: u32, height: u32) -> Vec<Dec
                         }
                         for d in &decoders { all.extend(d.results.iter().cloned()); }
                     }
-                    all
+                    // Scalar QR-only pass: re-scan each of the 4 columns to harvest
+                    // vertical QR finder lines. 1D results from this pass are discarded.
+                    let mut vl: Vec<QrFinderLine> = Vec::new();
+                    for &x in batch.iter() {
+                        let mut scn = Scanner::new();
+                        let mut dcode = Decoder::new();
+                        scan_single_col(gray, w, h, x, true, &mut scn, &mut dcode, &mut vl);
+                        scn.new_scan();
+                        dcode.new_scan();
+                        scan_single_col(gray, w, h, x, false, &mut scn, &mut dcode, &mut vl);
+                    }
+                    (all, Vec::new(), vl)
                 }
                 ScanTask::ScalarCol(x) => {
                     let mut scn = Scanner::new();
@@ -532,16 +554,24 @@ pub fn scan_image_neon_parallel(gray: &[u8], width: u32, height: u32) -> Vec<Dec
                     scn.new_scan();
                     dcode.new_scan();
                     scan_single_col(gray, w, h, *x, false, &mut scn, &mut dcode, &mut vl);
-                    let _ = vl;
-                    dcode.results
+                    (dcode.results, Vec::new(), vl)
                 }
             }
         })
         .collect();
 
     let mut results: Vec<DecodedSymbol> = Vec::new();
-    for r in all_results { results.extend(r); }
-    dedup_results(&results)
+    let mut hlines: Vec<QrFinderLine> = Vec::new();
+    let mut vlines: Vec<QrFinderLine> = Vec::new();
+    for (r, hl, vl) in all_results {
+        results.extend(r);
+        hlines.extend(hl);
+        vlines.extend(vl);
+    }
+    let mut out = dedup_results(&results);
+    let qr_results = decode_qr_codes(gray, width as i32, height as i32, &mut hlines, &mut vlines);
+    out.extend(qr_results);
+    out
 }
 
 /// Diagnostic: single-scale parallel scan that also returns the count of
