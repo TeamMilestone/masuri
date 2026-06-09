@@ -6,6 +6,7 @@
 pub mod ean;
 pub mod code128;
 pub mod i25;
+pub mod code39;
 
 use crate::SymbolType;
 use crate::qrcode::finder::QrFinderState;
@@ -41,6 +42,7 @@ pub struct Decoder {
     pub ean: ean::EanDecoder,
     pub code128: code128::Code128Decoder,
     pub i25: i25::I25Decoder,
+    pub code39: code39::Code39Decoder,
     pub qr: QrFinderState,
 
     // Collected results for current scan line
@@ -64,6 +66,7 @@ impl Decoder {
             ean: ean::EanDecoder::new(),
             code128: code128::Code128Decoder::new(),
             i25: i25::I25Decoder::new(),
+            code39: code39::Code39Decoder::new(),
             qr: QrFinderState::new(),
             results: Vec::new(),
             scanline_coord: 0,
@@ -82,6 +85,7 @@ impl Decoder {
         self.ean.reset();
         self.code128.reset();
         self.i25.reset();
+        self.code39.reset();
         self.qr.reset();
     }
 
@@ -92,6 +96,7 @@ impl Decoder {
         self.ean.new_scan();
         self.code128.reset();
         self.i25.reset();
+        self.code39.reset();
         self.qr.reset();
     }
 
@@ -206,6 +211,14 @@ impl Decoder {
         // Interleaved 2 of 5 decoder
         if self.i25.enabled() {
             let sym = i25::decode_i25(self);
+            if sym as i32 > SymbolType::Partial as i32 {
+                self.sym_type = sym;
+            }
+        }
+
+        // Code 39 decoder
+        if self.code39.enabled() {
+            let sym = code39::decode_code39(self);
             if sym as i32 > SymbolType::Partial as i32 {
                 self.sym_type = sym;
             }

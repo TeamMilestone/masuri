@@ -638,6 +638,7 @@ fn dedup_results(results: &[DecodedSymbol]) -> Vec<Decoded> {
                 13 => SymbolType::Ean13,
                 14 => SymbolType::Isbn13,
                 25 => SymbolType::I25,
+                39 => SymbolType::Code39,
                 64 => SymbolType::QrCode,
                 128 => SymbolType::Code128,
                 _ => SymbolType::None,
