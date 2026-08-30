@@ -148,10 +148,35 @@ fn code39_decode9(dcode: &mut Decoder) -> i8 {
         return -1;
     }
 
-    // threshold the first 5 element widths -> coarse 5-bit enc
+    // zbar의 고정 임계(decode_e, 2:1 비율 가정)는 3:1로 인쇄된 라벨에서 굵어진
+    // narrow 스페이스를 wide로 오분류한다. Code 39는 문자당 정확히 3개가 wide
+    // 라는 불변식이 있으므로, wide/narrow 분리가 뚜렷하면 상위 3개 폭을 wide로
+    // 분류한다. 분리가 모호하면(동률 또는 비율 < 1.2) 기존 임계로 폴백.
+    // 단 시작(`*`) 탐지에는 쓰지 않는다 — 관대한 분류는 노이즈에서 가짜 스타트를
+    // 양산해 진짜 스타트를 가리고, 고정 임계의 노이즈 기각이 거기서는 필수다.
+    let mut ws = [0u32; 9];
+    for i in 0..9u8 {
+        ws[i as usize] = dcode.get_width(i);
+    }
+    let mut sorted = ws;
+    sorted.sort_unstable();
+    let min_wide = sorted[6];
+    let max_narrow = sorted[5];
+    let split_ok = dcode.code39.character >= 0
+        && min_wide > max_narrow && min_wide * 5 >= max_narrow * 6;
+
     let mut enc: u8 = 0;
     for i in 0..5u8 {
-        enc = code39_decode1(enc, dcode.get_width(i), s9);
+        enc = if split_ok {
+            // 모아레로 1px까지 깎인 narrow도 sort 분류로는 유효하다 —
+            // 0폭(NEON 레인 flush 잔여물)과 과대폭(> s9/4)만 기각한다.
+            if ws[i as usize] == 0 || ws[i as usize] * 4 > s9 {
+                return -1;
+            }
+            (enc << 1) | (ws[i as usize] >= min_wide) as u8
+        } else {
+            code39_decode1(enc, ws[i as usize], s9)
+        };
         if enc == 0xff {
             return -1;
         }
@@ -166,7 +191,16 @@ fn code39_decode9(dcode: &mut Decoder) -> i8 {
 
     // encode remaining 4 widths (NB the first encoded bit is shifted out of u8)
     for i in 5..9u8 {
-        enc = code39_decode1(enc, dcode.get_width(i), s9);
+        enc = if split_ok {
+            // 모아레로 1px까지 깎인 narrow도 sort 분류로는 유효하다 —
+            // 0폭(NEON 레인 flush 잔여물)과 과대폭(> s9/4)만 기각한다.
+            if ws[i as usize] == 0 || ws[i as usize] * 4 > s9 {
+                return -1;
+            }
+            (enc << 1) | (ws[i as usize] >= min_wide) as u8
+        } else {
+            code39_decode1(enc, ws[i as usize], s9)
+        };
         if enc == 0xff {
             return -1;
         }

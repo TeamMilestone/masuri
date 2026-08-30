@@ -120,10 +120,13 @@ impl NeonScanner4 {
         let y2_2 = vsubq_s32(vaddq_s32(y0_prev, y0_3), y0_2_x2);
 
         // --- NEON zero-crossing detection ---
-        // y2_1 == 0 OR sign(y2_1) != sign(y2_2)
+        // zbar 원본: y2_1 == 0 || (y2_1 > 0 ? y2_2 < 0 : y2_2 > 0).
+        // y2_2는 엄격히 반대 부호여야 한다 — XOR 부호 비교는 y2_2 == 0인 케이스
+        // (y2_1 < 0)에서도 발화해 가짜 에지를 만들고 1D 폭 스트림을 오염시킨다.
         let y2_1_zero: uint32x4_t = vceqq_s32(y2_1, zero);
-        let y2_xored = veorq_s32(y2_1, y2_2);
-        let opp_sign: uint32x4_t = vcltq_s32(y2_xored, zero);
+        let neg_pos = vandq_u32(vcltq_s32(y2_1, zero), vcgtq_s32(y2_2, zero));
+        let pos_neg = vandq_u32(vcgtq_s32(y2_1, zero), vcltq_s32(y2_2, zero));
+        let opp_sign = vorrq_u32(neg_pos, pos_neg);
         let zero_cross = vorrq_u32(y2_1_zero, opp_sign);
 
         // Fast path: if no lane has zero crossing, skip
@@ -151,12 +154,15 @@ impl NeonScanner4 {
     }
 
     #[inline]
-    fn calc_thresh_lane(&self, lane: usize) -> u32 {
+    fn calc_thresh_lane(&mut self, lane: usize, x: usize) -> u32 {
         let thresh = self.y1_thresh[lane];
         if thresh <= THRESH_MIN || self.width[lane] == 0 {
             return THRESH_MIN;
         }
-        let dx = (self.x << ZBAR_FIXED as u32).wrapping_sub(self.last_edge[lane]);
+        // zbar 원본은 증가 전 x로 fade를 계산한다. scan_y_4가 self.x를 먼저
+        // 증가시키므로 self.x를 읽으면 dx가 1px 커져 임계가 일찍 풀리고,
+        // 스칼라가 무시하는 저대비 요동을 에지로 쪼갠다.
+        let dx = ((x as u32) << ZBAR_FIXED as u32).wrapping_sub(self.last_edge[lane]);
         let t = (thresh as u64 * dx as u64 / self.width[lane] as u64 / THRESH_FADE as u64) as u32;
         if thresh > t {
             let new_thresh = thresh - t;
@@ -164,17 +170,23 @@ impl NeonScanner4 {
                 return new_thresh;
             }
         }
+        // zbar 원본은 fade가 바닥나면 상태를 THRESH_MIN으로 저장한다 — 저장하지
+        // 않으면 이후 fade 계산이 스칼라 경로와 어긋난다.
+        self.y1_thresh[lane] = THRESH_MIN;
         THRESH_MIN
     }
 
     #[inline]
     fn edge_check_lane(&mut self, lane: usize, x: usize, y1: i32, y2_1: i32, y2_2: i32) -> EdgeResult {
-        let thresh = self.calc_thresh_lane(lane);
+        let thresh = self.calc_thresh_lane(lane, x);
         if thresh > y1.unsigned_abs() {
             return EdgeResult::none();
         }
 
-        let y1_rev = if self.y1_sign[lane] > 0 { y1 < 0 } else if self.y1_sign[lane] < 0 { y1 > 0 } else { false };
+        // zbar 원본: y1_sign == 0(스캔라인 첫 에지)일 때도 y1 > 0이면 에지로
+        // 처리한다. 이걸 누르면 첫 에지가 빠져 폭 스트림 전체의 bar/space
+        // 패리티가 뒤집히고, 흰 배경에서 시작하는 라인의 1D 디코딩이 전멸한다.
+        let y1_rev = if self.y1_sign[lane] > 0 { y1 < 0 } else { y1 > 0 };
         let mut result = EdgeResult::none();
 
         if y1_rev {
