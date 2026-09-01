@@ -320,8 +320,12 @@ pub fn decode_code39(dcode: &mut Decoder) -> SymbolType {
             let min_len = dcode.code39.configs[CFG_MIN_LEN];
             let max_len = dcode.code39.configs[CFG_MAX_LEN];
             let mut sym = SymbolType::None;
-            if space != 0 && space < width / 2 {
-                // invalid trailing quiet zone
+            if space != 0 && space * 24 < width {
+                // 정지 문자 뒤 여백. 규격은 narrow 10배지만 현장 라벨(AMT 운송장)은
+                // 심볼 바로 옆 한 모듈 간격에 동반 Code-39 문자를 찍어 여백이 없다.
+                // 여기까지 온 심볼은 시작/정지 문자 + MIN_LEN개 이상 + 문자 간 폭
+                // 일관성을 이미 통과했으므로, 남은 확인은 "정지 바가 옆 잉크에
+                // 붙지 않았다" 뿐 — narrow 모듈(≈ width/12)의 절반으로 충분하다.
             } else if (character as i32) < min_len
                 || (max_len > 0 && (character as i32) > max_len)
             {
